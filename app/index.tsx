@@ -5,11 +5,9 @@ import * as Haptics from 'expo-haptics';
 import { useAnimatedStyle, useSharedValue, withRepeat, withSequence, withTiming } from 'react-native-reanimated';
 import { Audio as ExpoAudio } from 'expo-av';
 import { File } from 'expo-file-system';
-import * as FileSystem from 'expo-file-system/legacy';
 import * as ImagePicker from 'expo-image-picker';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import * as Sharing from 'expo-sharing';
-import * as MediaLibrary from 'expo-media-library';
+import * as Speech from 'expo-speech';
 import { VideoView, useVideoPlayer } from 'expo-video';
 import { Image as ExpoImage } from 'expo-image';
 import { blink } from '@/lib/blink';
@@ -57,7 +55,6 @@ const COIN_PACKS = [
   { coins: 500, price: '$3.99' },
   { coins: 1200, price: '$7.99' },
 ];
-const TRANSCRIPTION_ENDPOINT = 'https://kn8pvg1l.backend.blink.new/api/transcribe';
 
 const knowledgeTable = blink.db.table<VillageVoiceKnowledgeRow>('village_voice_knowledge');
 const adminMessagesTable = blink.db.table<VillageVoiceAdminMessagesRow>('village_voice_admin_messages');
@@ -252,51 +249,32 @@ function AvatarStage({ isSpeaking }: { isSpeaking: boolean }) {
 }
 
 function StudioVideoPreview({ url, index, onDownload }: { url: string; index: number; onDownload: (url: string, index: number) => void }) {
-  const player = useVideoPlayer(url, (videoPlayer) => {
-    videoPlayer.loop = true;
-    videoPlayer.muted = false;
-    videoPlayer.play();
-  });
+  const sceneText = decodeURIComponent(url.split('-').slice(4).join('-'));
 
   return (
     <YStack gap="$2" width="100%">
-      <SizableText size="$2" color="#8A542B" fontWeight="800">SCENE {index + 1} · 12 SECONDS</SizableText>
-      <YStack height={230} borderRadius="$5" overflow="hidden" backgroundColor="#24362B">
-        <VideoView player={player} style={{ width: '100%', height: 230 }} contentFit="contain" nativeControls />
+      <SizableText size="$2" color="#8A542B" fontWeight="800">SCENE {index + 1} · FREE LOCAL LESSON</SizableText>
+      <YStack minHeight={150} borderRadius="$5" padding="$4" justifyContent="center" backgroundColor="#F5EBDD" gap="$3">
+        <SizableText color="#573E2A" fontWeight="700">{sceneText}</SizableText>
+        <SizableText size="$2" color="#8A542B">This scene is a device-generated lesson plan, not a hosted AI video.</SizableText>
       </YStack>
       <Button height={44} backgroundColor="#F4C66A" borderRadius="$3" onPress={() => onDownload(url, index)}>
-        <SizableText color="#24362B" fontWeight="900">Download scene {index + 1}</SizableText>
+        <Volume2 size={16} color="#24362B" /><SizableText color="#24362B" fontWeight="900">Read scene {index + 1} aloud</SizableText>
       </Button>
     </YStack>
   );
 }
 
 async function speakWithAvatar(text: string) {
-  const token = await blink.auth.getValidToken();
-  if (!token) throw new Error('Sign in to hear Tavi speak.');
-  const { url } = await blink.ai.generateSpeech({ text, voice: 'nova' });
-  if (Platform.OS === 'web') {
-    const audio = new Audio(url);
-    await new Promise<void>((resolve, reject) => {
-      audio.onended = () => resolve();
-      audio.onerror = () => reject(new Error('Tavi audio could not be played.'));
-      void audio.play().catch(reject);
-    });
-    return;
-  }
-  const { sound } = await ExpoAudio.Sound.createAsync({ uri: url });
+  await Speech.stop();
   await new Promise<void>((resolve, reject) => {
-    sound.setOnPlaybackStatusUpdate((status) => {
-      if (!status.isLoaded) {
-        if (status.error) reject(new Error(status.error));
-        return;
-      }
-      if (status.didJustFinish) {
-        void sound.unloadAsync();
-        resolve();
-      }
+    Speech.speak(text, {
+      rate: 0.88,
+      pitch: 1,
+      onDone: resolve,
+      onStopped: resolve,
+      onError: () => reject(new Error('Tavi audio could not be played.')),
     });
-    void sound.playAsync().catch(reject);
   });
 }
 
@@ -334,7 +312,7 @@ export default function Home() {
   const [studioVideos, setStudioVideos] = useState<string[]>([]);
   const [studioBusy, setStudioBusy] = useState(false);
   const [studioProgress, setStudioProgress] = useState(0);
-  const [studioUnlocked, setStudioUnlocked] = useState(false);
+  const [studioUnlocked, setStudioUnlocked] = useState(true);
   const [studioNotice, setStudioNotice] = useState<string | null>(null);
   const [studioError, setStudioError] = useState<string | null>(null);
   const [studioDownloadBusy, setStudioDownloadBusy] = useState(false);
@@ -543,39 +521,20 @@ export default function Home() {
 
   const downloadStudioVideo = async (url: string, index: number) => {
     if (!isSignedIn) {
-      setStudioError('Sign in to download your Tavi video.');
+      setStudioError('Sign in to hear your Tavi lesson.');
       return;
     }
     setStudioDownloadBusy(true);
     setStudioError(null);
     try {
-      if (Platform.OS === 'web') {
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = `village-voice-tavi-scene-${index + 1}.mp4`;
-        link.target = '_blank';
-        link.rel = 'noreferrer';
-        document.body.appendChild(link);
-        link.click();
-        link.remove();
-        setStudioNotice(`Scene ${index + 1} download started.`);
-        return;
-      }
-      const destination = `${FileSystem.cacheDirectory || ''}village-voice-tavi-scene-${index + 1}.mp4`;
-      const downloaded = await FileSystem.downloadAsync(url, destination);
-      const mediaPermission = await MediaLibrary.requestPermissionsAsync();
-      if (mediaPermission.granted) {
-        await MediaLibrary.saveToLibraryAsync(downloaded.uri);
-        setStudioNotice(`Scene ${index + 1} was saved to your device gallery.`);
-      } else if (await Sharing.isAvailableAsync()) {
-        await Sharing.shareAsync(downloaded.uri, { mimeType: 'video/mp4', dialogTitle: 'Save your Tavi story' });
-        setStudioNotice(`Scene ${index + 1} is ready to save or share.`);
-      } else {
-        throw new Error('Allow photo and video access to save this scene to your device.');
-      }
+      const sceneText = decodeURIComponent(url.split('-').slice(4).join('-'));
+      setIsSpeaking(true);
+      await speakWithAvatar(sceneText);
+      setStudioNotice(`Scene ${index + 1} was read aloud using your device voice.`);
     } catch (error) {
       setStudioError(readableError(error));
     } finally {
+      setIsSpeaking(false);
       setStudioDownloadBusy(false);
     }
   };
@@ -619,18 +578,9 @@ export default function Home() {
       const kind = asset.type === 'video' ? 'video' : 'photo';
       setStudioAttachment({ url: uploaded.publicUrl, name: fileName, kind });
       if (kind === 'photo') {
-        const response = await blink.ai.generateText({
-          messages: [{
-            role: 'user',
-            content: [
-              { type: 'text', text: 'You are Tavi, a village-language preservation assistant. Describe this reference photo in a short production brief for a family-friendly 45–60 second EBEMBE story video. Do not invent EBEMBE words. Keep the spoken language EBEMBE only where verified, with a little clear Swahili if needed.' },
-              { type: 'image', image: uploaded.publicUrl },
-            ],
-          }],
-        });
-        setStudioAnalysis(response.text);
+        setStudioAnalysis('Photo reference received. The free local story maker will use your written brief and this reference name to shape the lesson scenes.');
       } else {
-        setStudioAnalysis('Video reference received. Tavi will use your written brief and this reference to shape the story scenes.');
+        setStudioAnalysis('Video reference received. The free local story maker will use your written brief and this reference to shape the story scenes.');
       }
       setStudioNotice(`${kind === 'photo' ? 'Photo' : 'Video'} uploaded. Tavi recognized the reference and is ready to create.`);
     } catch (error) {
@@ -640,43 +590,40 @@ export default function Home() {
 
   const createStudioStory = async () => {
     if (!isSignedIn) {
-      setStudioError('Sign in before creating a Tavi story video.');
+      setStudioError('Sign in before creating a Tavi story lesson.');
       return;
     }
     if (!studioUnlocked) {
-      setStudioError('Unlock Story Studio with the 500-coin premium pack before generating.');
+      setStudioError('Unlock Story Studio with the 500-coin premium pack before creating.');
       return;
     }
     const brief = studioPrompt.trim() || 'Create a warm village story that teaches a simple greeting to a learner.';
     setStudioBusy(true);
     setStudioProgress(0);
     setStudioError(null);
-    setStudioNotice('Tavi is preparing a four-scene story in EBEMBE with a little Swahili.');
+    setStudioNotice('Tavi is preparing a free local lesson plan — no Blink AI credits are used.');
     setStudioVideos([]);
     try {
       const currentKnowledge = await readCurrentKnowledge();
       setAdminEntries(currentKnowledge);
-      const verifiedWords = vocabularyContext(currentKnowledge);
-      const reference = studioAnalysis ? `Reference understanding: ${studioAnalysis}` : studioAttachment ? `A ${studioAttachment.kind} reference was attached at ${studioAttachment.url}.` : 'No media reference was attached.';
+      const verifiedWords = currentKnowledge.filter((entry) => entry.status === 'verified').slice(0, 4);
+      const lessonWords = verifiedWords.length > 0 ? verifiedWords : words.map((word) => ({ phrase: word.native, meaning: word.meaning, pronunciation: word.sound }));
       const sceneDirections = [
-        'Open with a natural village welcome: gentle eye contact, blinking, breathing, head movement, and a clear greeting.',
-        'Show Tavi demonstrating the key word with expressive hands and a warm teaching gesture.',
-        'Show a learner responding while Tavi listens, nods, smiles, and moves naturally.',
-        'Close with Tavi repeating the phrase slowly and clearly, then invite the learner to practice.',
+        'Welcome the learner warmly and introduce the lesson.',
+        'Demonstrate the key village word with its meaning and pronunciation.',
+        'Invite the learner to repeat the word and connect it to daily life.',
+        'Review the word and encourage another practice round.',
       ];
+      const nextVideos: string[] = [];
       for (let index = 0; index < STUDIO_CLIP_COUNT; index += 1) {
-        const response = await blink.ai.generateVideo({
-          model: 'fal-ai/veo3.1/fast',
-          duration: '12s',
-          aspect_ratio: '9:16',
-          generate_audio: true,
-          prompt: `Create scene ${index + 1} of a connected 48-second Village Voice language lesson featuring Gloire Sadiki, called Tavi. ${sceneDirections[index]} User request: ${brief}. ${reference} Spoken audio must be slow, clear, human-like, and use EBEMBE only from these verified entries: ${verifiedWords}. Use only a little simple Swahili for transitions when needed. Never invent an EBEMBE translation, pronunciation, grammar rule, or cultural fact. Tavi must visibly blink, breathe, move the head and hands, and speak with natural mouth and tongue movement. Keep the same character, clothing, lighting, village setting, and voice across all scenes.`,
-          negative_prompt: 'frozen face, blank stare, no blinking, stiff body, lip-sync mismatch, distorted mouth, invented language words, subtitles with misspellings, unsafe content',
-        });
-        setStudioVideos((current) => [...current, response.result.video.url]);
+        const word = lessonWords[index % lessonWords.length];
+        const sceneText = `Scene ${index + 1}: ${sceneDirections[index]} ${brief} Practice ${word.phrase}, meaning ${word.meaning}${word.pronunciation ? `, pronounced ${word.pronunciation}` : ''}.`;
+        nextVideos.push(`local://village-voice-scene-${index + 1}-${encodeURIComponent(sceneText)}`);
+        setStudioVideos([...nextVideos]);
         setStudioProgress(Math.round(((index + 1) / STUDIO_CLIP_COUNT) * 100));
+        await new Promise((resolve) => setTimeout(resolve, 180));
       }
-      setStudioNotice('Your 48-second four-scene Tavi story is ready. Play each connected scene to review the movement, blinking, audio, and language before sharing.');
+      setStudioNotice('Your free four-scene lesson plan is ready. Tavi can read each scene aloud using your device voice — no hosted AI generation was used.');
     } catch (error) {
       setStudioError(readableError(error));
     } finally {
@@ -713,11 +660,6 @@ export default function Home() {
 
   const playAvatar = async (text: string) => {
     impact();
-    if (!isSignedIn) {
-      setAuthError('Continue with Google to let Tavi speak with you.');
-      await signInWithGoogle();
-      return;
-    }
     setIsSpeaking(true);
     setTutorError(null);
     try {
@@ -749,16 +691,6 @@ export default function Home() {
   const askGuide = async (promptOverride?: string) => {
     const trimmedQuestion = (promptOverride ?? question).trim();
     if (!trimmedQuestion || isThinking) return;
-    if (!isSignedIn) {
-      setAuthError('Continue with Google to send your question to Tavi.');
-      await signInWithGoogle();
-      return;
-    }
-    if (freeUsesUsed >= FREE_AI_USES && !coinBalanceLoading && coinBalance < AI_COIN_COST) {
-      setCoinNotice('You used your two free answers. Add coins to continue speaking with Tavi.');
-      setWalletOpen(true);
-      return;
-    }
     impact();
     setQuestion('');
     setTutorError(null);
@@ -768,27 +700,26 @@ export default function Home() {
     try {
       const currentKnowledge = await readCurrentKnowledge();
       setAdminEntries(currentKnowledge);
-      const safeMessages = removeTrashFromMessages(nextMessages, currentKnowledge);
-      const response = await blink.ai.generateText({
-        messages: [
-          { role: 'system', content: tutorPrompt(conversationLanguage, conversationMode, currentKnowledge) },
-          ...safeMessages.map((message) => ({ role: message.role, content: message.content })),
-        ],
-      });
-      const safeResponse = removeTrashFromText(response.text, currentKnowledge);
-      if (freeUsesUsed < FREE_AI_USES) {
-        await markFreeUse();
-      } else if (!(await consumeCoin())) {
-        setCoinNotice('You need 1 coin to continue. Open Wallet to add coins.');
-        setWalletOpen(true);
-        throw new Error('Payment required.');
-      }
+      const safeQuestion = removeTrashFromText(trimmedQuestion, currentKnowledge);
+      const matchedEntry = currentKnowledge.find((entry) => entry.status === 'verified' && safeQuestion.toLocaleLowerCase().includes(entry.phrase.toLocaleLowerCase()));
+      const responseText = matchedEntry
+        ? `${matchedEntry.phrase} means ${matchedEntry.meaning}${matchedEntry.pronunciation ? `. Say it like ${matchedEntry.pronunciation}.` : '.'} ${matchedEntry.context || 'Try using it in a warm village greeting.'}`
+        : safeQuestion.toLocaleLowerCase().includes('hello') || safeQuestion.toLocaleLowerCase().includes('greet')
+          ? 'Mōra means Hello. Try saying it slowly, then listen for the rhythm.'
+          : safeQuestion.toLocaleLowerCase().includes('thank')
+            ? 'Ayo means Thank you. It is a warm way to show appreciation.'
+            : safeQuestion.toLocaleLowerCase().includes('water')
+              ? 'Nami means Water. Repeat it twice and connect it to something you see around you.'
+              : conversationMode === 'joke'
+                ? 'Here is a tiny village-learning joke: Why did the word bring a notebook? Because it wanted to make a good impression!'
+                : conversationMode === 'story'
+                  ? 'Once, a learner carried one new word home each day. Before long, the whole family was greeting one another with a living village voice.'
+                  : 'I can teach verified community words. Ask me about Mōra, Ayo, Nami, or a phrase an elder has added for review.';
+      const safeResponse = removeTrashFromText(responseText, currentKnowledge);
       setMessages((current) => [...current, { role: 'assistant', content: safeResponse }]);
       await playAvatar(safeResponse);
     } catch (error) {
-      if (!(error instanceof Error && error.message === 'Payment required')) {
-        setTutorError(readableError(error));
-      }
+      setTutorError(readableError(error));
     } finally {
       setIsThinking(false);
     }
@@ -903,28 +834,9 @@ export default function Home() {
     }
   };
 
-  const transcribeAudioInput = async (audio: string) => {
-    setIsTranscribing(true);
-    setTutorError(null);
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 30_000);
-    try {
-      const response = await fetch(TRANSCRIPTION_ENDPOINT, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ audio, language: conversationLanguage === 'swahili' ? 'sw' : 'en' }),
-        signal: controller.signal,
-      });
-      const payload = await response.json() as { text?: string; error?: string };
-      if (!response.ok) throw new Error(payload.error || 'Audio transcription failed.');
-      if (!payload.text?.trim()) throw new Error('Tavi could not hear that recording. Please try again.');
-      await askGuide(payload.text.trim());
-    } catch (error) {
-      setTutorError(error instanceof DOMException && error.name === 'AbortError' ? 'Audio transcription took too long. Please record a shorter question.' : readableError(error));
-    } finally {
-      clearTimeout(timeout);
-      setIsTranscribing(false);
-    }
+  const transcribeAudioInput = async (_audio: string) => {
+    setIsTranscribing(false);
+    setTutorError('Voice-to-text is disabled to keep Village Voice completely free of hosted AI charges. Type your question instead.');
   };
 
   const stopRecording = async () => {
@@ -965,6 +877,8 @@ export default function Home() {
 
   const startRecording = async () => {
     if (isRecording || isTranscribing) return;
+    setTutorError('Voice-to-text is disabled to keep Village Voice completely free of hosted AI charges. Type your question instead.');
+    return;
     if (!isSignedIn && freeUsesUsed >= FREE_AI_USES) {
       setAuthError('Your two free questions are used. Continue with Google to keep learning with Tavi.');
       await signInWithGoogle();
@@ -1098,7 +1012,7 @@ export default function Home() {
                 <H2 color="#573E2A" fontSize={24}>Meet Tavi</H2>
                 <SizableText size="$1" color="#8A542B" fontWeight="700" maxWidth={190}>{TAVI_FULL_NAME}</SizableText>
                 <Paragraph color="#765F4B" size="$3">Ask a question and Tavi will answer using verified community words.</Paragraph>
-                  <Button height={46} alignSelf="flex-start" backgroundColor="#315C45" borderRadius="$4" onPress={() => void playAvatar(AVATAR_GREETING)} disabled={isSpeaking || !isSignedIn}>
+                  <Button height={46} alignSelf="flex-start" backgroundColor="#315C45" borderRadius="$4" onPress={() => void playAvatar(AVATAR_GREETING)} disabled={isSpeaking}>
                   {isSpeaking ? <SizableText color="#FFFDF7" fontWeight="800">Speaking…</SizableText> : <><Play size={16} color="#FFFDF7" /><SizableText color="#FFFDF7" fontWeight="800">Hear greeting</SizableText></>}
                 </Button>
               </YStack>
@@ -1125,7 +1039,7 @@ export default function Home() {
                   </YStack>
                 </XStack>
               ))}
-              <SizableText size="$2" color="#8A542B">{isSignedIn ? `Free AI answers: ${Math.max(0, FREE_AI_USES - freeUsesUsed)}/${FREE_AI_USES} · then ${AI_COIN_COST} coin per answer.` : `Free AI answers: ${Math.max(0, FREE_AI_USES - freeUsesUsed)}/${FREE_AI_USES} · after that, Continue with Google.`}</SizableText>
+              <SizableText size="$2" color="#8A542B">Free local guide answers: unlimited · no Blink AI credits used.</SizableText>
               {isThinking && <SizableText color="#8A542B">Tavi is thinking in {LANGUAGE_LABELS[conversationLanguage]}…</SizableText>}
               {isTranscribing && <SizableText color="#8A542B">Tavi is listening to your question…</SizableText>}
               <XStack alignItems="center" gap="$2">
@@ -1159,29 +1073,29 @@ export default function Home() {
                 </Button>
                 {studioAttachment && <YStack justifyContent="center" flex={1} minWidth={130}><SizableText size="$2" color="#FFFDF7" numberOfLines={1}>{studioAttachment.name}</SizableText><SizableText size="$1" color="#C9E3C5">Reference ready</SizableText></YStack>}
               </XStack>
-              <SizableText size="$2" color="#C9E3C5">You can also talk to Tavi with the microphone in the language guide above. Tavi will recognize your request and use it as the lesson direction.</SizableText>
+              <SizableText size="$2" color="#C9E3C5">Type a creative brief and Tavi will turn verified community words into a free local lesson plan. Read each scene aloud with your device voice.</SizableText>
             </YStack>
             {!studioUnlocked ? (
-              <Button height={50} backgroundColor="#E79A5A" borderRadius="$4" onPress={() => void unlockStudio()} disabled={studioBusy || coinMarketLoading || !isSignedIn}>
-                <LockKeyhole size={18} color="#FFFDF7" /><SizableText color="#FFFDF7" fontWeight="900">{isSignedIn ? 'Unlock with 500 coins' : 'Sign in to unlock Story Studio'}</SizableText>
+              <Button height={50} backgroundColor="#E79A5A" borderRadius="$4" onPress={() => void unlockStudio()} disabled={studioBusy || coinMarketLoading}>
+              <LockKeyhole size={18} color="#FFFDF7" /><SizableText color="#FFFDF7" fontWeight="900">Create free local lesson</SizableText>
               </Button>
             ) : (
               <Button height={50} backgroundColor="#F4C66A" borderRadius="$4" onPress={() => void createStudioStory()} disabled={studioBusy}>
-                <Play size={18} color="#24362B" /><SizableText color="#24362B" fontWeight="900">{studioBusy ? `Creating Tavi scenes… ${studioProgress}%` : 'Create 45–60 second story'}</SizableText>
+                <Play size={18} color="#24362B" /><SizableText color="#24362B" fontWeight="900">{studioBusy ? `Creating local scenes… ${studioProgress}%` : 'Create free lesson plan'}</SizableText>
               </Button>
             )}
             {studioBusy && <Progress value={studioProgress} backgroundColor="#50755D" height={8} borderRadius="$10"><Progress.Indicator backgroundColor="#F4C66A" animation="bouncy" /></Progress>}
             {studioAnalysis && <YStack backgroundColor="#FFFDF7" borderRadius="$3" padding="$3"><SizableText size="$2" color="#573E2A" fontWeight="800">TAVI RECOGNIZED</SizableText><SizableText size="$2" color="#573E2A">{studioAnalysis}</SizableText></YStack>}
             {studioNotice && <SizableText size="$2" color="#F4C66A">{studioNotice}</SizableText>}
             {studioError && <SizableText size="$2" color="#F7B8A8">{studioError}</SizableText>}
-            {studioVideos.length > 0 && <YStack gap="$4"><SizableText color="#FFFDF7" fontWeight="900">YOUR TAVI STORY · {studioVideos.length * 12} SECONDS</SizableText>{studioVideos.map((url, index) => <StudioVideoPreview key={url} url={url} index={index} onDownload={(videoUrl, sceneIndex) => void downloadStudioVideo(videoUrl, sceneIndex)} />)}</YStack>}
+            {studioVideos.length > 0 && <YStack gap="$4"><SizableText color="#FFFDF7" fontWeight="900">YOUR TAVI LESSON · {studioVideos.length} SCENES</SizableText>{studioVideos.map((url, index) => <StudioVideoPreview key={url} url={url} index={index} onDownload={(videoUrl, sceneIndex) => void downloadStudioVideo(videoUrl, sceneIndex)} />)}</YStack>}
           </Card>
 
           {!authLoading && !isSignedIn && (
             <Card backgroundColor="#FFFDF7" borderColor="#D8C7B0" borderWidth={1} borderRadius="$5" padding="$4" gap="$3">
               <YStack gap="$1">
                 <H3 color="#24362B">Keep learning with Tavi</H3>
-                <Paragraph color="#667066">You get two free AI answers. Continue with Google to unlock your account, wallet, and coin-powered conversations.</Paragraph>
+                <Paragraph color="#667066">Use the free local guide without hosted AI charges. Continue with Google only when you want to sync your profile, community memory, or wallet.</Paragraph>
               </YStack>
               <Button height={52} backgroundColor="#FFFDF7" borderColor="#315C45" borderWidth={2} borderRadius="$4" onPress={() => void signInWithGoogle()} disabled={authBusy}>
                 <SizableText color="#24362B" fontWeight="900">{authBusy ? 'Opening Google…' : 'Continue with Google'}</SizableText>
@@ -1288,7 +1202,7 @@ export default function Home() {
                 <XStack alignItems="center" gap="$2">
                   <Input flex={1} height={44} value={adminQuestion} onChangeText={(value) => { const next = capitalizeTypedText(value); setAdminQuestion(next); setAdminTyping(next.trim().length > 0); }} autoCapitalize="sentences" onSubmitEditing={() => undefined} placeholder="Ask Tavi to explain or propose a phrase" backgroundColor="#F7F4EC" borderColor={adminTyping ? '#E79A5A' : '#D8C7B0'} borderWidth={adminTyping ? 2 : 1} borderRadius="$4" color="#24362B" />
                   {adminTyping && <Button circular size="$5" backgroundColor="#E79A5A" onPress={() => void playAvatar('The administrator is writing a new language question.')} aria-label="Hear writing status" accessibilityLabel="Hear writing status"><Volume2 size={17} color="#FFFDF7" /></Button>}
-                  <Button height={44} backgroundColor="#E79A5A" borderRadius="$4" disabled={adminBusy} onPress={async () => { const text = capitalizeTypedText(adminQuestion.trim()); if (!text || adminBusy) return; setAdminQuestion(''); setAdminTyping(false); setAdminBusy(true); try { await adminMessagesTable.create({ id: `admin_${Date.now()}`, userId: ADMIN_USER_ID, role: 'admin', content: text }); const currentKnowledge = await readCurrentKnowledge(); setAdminEntries(currentKnowledge); const response = await blink.ai.generateText({ messages: [{ role: 'system', content: adminTutorPrompt(currentKnowledge) }, ...adminMessages.slice(-8).map((message) => ({ role: message.role, content: message.content })), { role: 'user', content: text }] }); await adminMessagesTable.create({ id: `tavi_${Date.now()}`, userId: ADMIN_USER_ID, role: 'tavi', content: response.text }); setAdminMessages((current) => [...current, { role: 'user', content: text }, { role: 'assistant', content: response.text }]); await playAvatar(response.text); } catch (error) { setAdminNotice(readableError(error)); } finally { setAdminBusy(false); } }}><Send size={16} color="#FFFDF7" /></Button>
+                  <Button height={44} backgroundColor="#E79A5A" borderRadius="$4" disabled={adminBusy} onPress={async () => { const text = capitalizeTypedText(adminQuestion.trim()); if (!text || adminBusy) return; setAdminQuestion(''); setAdminTyping(false); setAdminBusy(true); try { await adminMessagesTable.create({ id: `admin_${Date.now()}`, userId: ADMIN_USER_ID, role: 'admin', content: text }); const currentKnowledge = await readCurrentKnowledge(); setAdminEntries(currentKnowledge); const matchedEntry = currentKnowledge.find((entry) => entry.status === 'verified' && text.toLocaleLowerCase().includes(entry.phrase.toLocaleLowerCase())); const responseText = matchedEntry ? `${matchedEntry.phrase} means ${matchedEntry.meaning}${matchedEntry.pronunciation ? `. Say it like ${matchedEntry.pronunciation}.` : '.'}` : 'This is a free local guide. Add or verify a phrase below, then ask me about that confirmed community word.'; await adminMessagesTable.create({ id: `tavi_${Date.now()}`, userId: ADMIN_USER_ID, role: 'tavi', content: responseText }); setAdminMessages((current) => [...current, { role: 'user', content: text }, { role: 'assistant', content: responseText }]); await playAvatar(responseText); } catch (error) { setAdminNotice(readableError(error)); } finally { setAdminBusy(false); } }}><Send size={16} color="#FFFDF7" /></Button>
                 </XStack>
               </YStack>
               {adminNotice && <SizableText size="$2" color="#8A542B">{adminNotice}</SizableText>}
@@ -1303,7 +1217,7 @@ export default function Home() {
               <Button height={44} backgroundColor="#315C45" borderRadius="$4" onPress={() => setWalletOpen((open) => !open)}>
                 <SizableText color="#FFFDF7" fontWeight="900">{walletOpen ? 'Hide coin packs' : 'Open wallet · Buy coins'}</SizableText>
               </Button>
-              <Paragraph color="#765F4B">After your two free answers, each AI answer costs 1 coin. Buy coins securely with real money through the App Store or Google Play.</Paragraph>
+              <Paragraph color="#765F4B">Tavi now runs locally with no Blink AI charges. Coins remain available for future premium app features.</Paragraph>
               {walletOpen && (
                 <YStack gap="$3">
                   {coinBalanceError && <SizableText size="$2" color="#B45C4A">{coinBalanceError}</SizableText>}

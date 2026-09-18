@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "blink-expo-starter",
+    "name": "Gsadiki AI",
     "slug": "village-voice-app-kn8pvg1l",
     "version": "1.0.0",
     "orientation": "portrait",
@@ -28,7 +28,7 @@
         "foregroundImage": "./assets/images/icon.png",
         "backgroundColor": "#ffffff"
       },
-      "package": "com.blink.expostarter",
+      "package": "www.Gsadiki.com",
       "permissions": [
         "android.permission.RECORD_AUDIO",
         "android.permission.MODIFY_AUDIO_SETTINGS",

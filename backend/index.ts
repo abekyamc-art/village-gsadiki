@@ -12,26 +12,6 @@ const getBlink = (env: Record<string, string>) => createClient({
 
 app.get('/health', (c) => c.json({ ok: true }))
 
-app.post('/api/transcribe', async (c) => {
-  try {
-    const body = await c.req.json() as { audio?: string; language?: string }
-    const audio = body.audio?.trim()
-    if (!audio) return c.json({ error: 'Audio is required.' }, 400)
-    if (audio.length > 12_000_000) return c.json({ error: 'Audio is too large. Record a shorter question.' }, 413)
-
-    const blink = getBlink(c.env as Record<string, string>)
-    const result = await blink.ai.transcribeAudio({
-      audio,
-      language: body.language === 'sw' ? 'sw' : 'en',
-      model: 'fal-ai/whisper',
-    })
-    return c.json({ text: result.text })
-  } catch (error) {
-    const message = error instanceof Error ? error.message : 'Audio transcription failed.'
-    return c.json({ error: message }, 500)
-  }
-})
-
 app.post('/api/revenuecat/webhook', async (c) => {
   const env = c.env as Record<string, string>
   const authorization = c.req.header('Authorization')
