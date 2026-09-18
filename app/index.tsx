@@ -7,6 +7,7 @@ import * as ImagePicker from 'expo-image-picker';
 import { File } from 'expo-file-system';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Speech from 'expo-speech';
+import { Audio as ExpoAudio } from 'expo-av';
 import { ExpoSpeechRecognitionModule, useSpeechRecognitionEvent } from 'expo-speech-recognition';
 import { VideoView, useVideoPlayer } from 'expo-video';
 import { Image as ExpoImage } from 'expo-image';
@@ -50,6 +51,17 @@ const ASIA_RECOGNITION_LOCALES = ['sw-TZ', 'sw-KE', 'fr-FR', 'en-US'];
 
 type RecognitionMode = 'offline' | 'online';
 type PlaybackLength = 'short' | 'normal' | 'long';
+type BrowserSpeechRecognizer = {
+  lang: string;
+  continuous: boolean;
+  interimResults: boolean;
+  maxAlternatives: number;
+  onresult: ((event: { resultIndex: number; results: ArrayLike<{ isFinal: boolean; 0: { transcript: string } }> }) => void) | null;
+  onerror: ((event: { error?: string; message?: string }) => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+};
 
 const knowledgeTable = blink.db.table<VillageVoiceKnowledgeRow>('village_voice_knowledge');
 const adminMessagesTable = blink.db.table<VillageVoiceAdminMessagesRow>('village_voice_admin_messages');
@@ -165,9 +177,9 @@ Trash memory is deliberately omitted. Any phrase the administrator declined has 
 }
 
 const words = [
-  { native: 'Mōra', meaning: 'Hello', sound: 'MOH-rah' },
-  { native: 'Ayo', meaning: 'Thank you', sound: 'AH-yoh' },
-  { native: 'Nami', meaning: 'Water', sound: 'NAH-mee' },
+  { native: 'Lobe china hibeni', meaning: 'What is your name?', sound: 'Lobe china hibeni' },
+  { native: 'Sola', meaning: 'Face', sound: 'Solá' },
+  { native: 'Chemi', meaning: 'Pregnant', sound: 'Chemi' },
 ];
 
 function impact() {
@@ -215,10 +227,7 @@ function recognizedVillagePhrase(transcript: string, entries: VillageVoiceKnowle
       })),
   ];
   const normalizedTranscript = normalizeSpeechText(transcript);
-  const directMatch = candidates.find((candidate) => candidate.aliases.some((alias) => {
-    const normalizedAlias = normalizeSpeechText(alias);
-    return normalizedAlias && (normalizedTranscript === normalizedAlias || normalizedTranscript.includes(` ${normalizedAlias} `) || normalizedTranscript.startsWith(`${normalizedAlias} `) || normalizedTranscript.endsWith(` ${normalizedAlias}`));
-  }));
+  const directMatch = candidates.find((candidate) => candidate.aliases.some((alias) => normalizeSpeechText(alias) === normalizedTranscript));
   if (directMatch) return directMatch.phrase;
 
   const closeMatch = candidates.find((candidate) => candidate.aliases.some((alias) => {
@@ -227,6 +236,35 @@ function recognizedVillagePhrase(transcript: string, entries: VillageVoiceKnowle
     return levenshteinDistance(normalizedTranscript, normalizedAlias) <= Math.max(1, Math.floor(normalizedAlias.length / 4));
   }));
   return closeMatch?.phrase || capitalizeTypedText(transcript);
+}
+
+function recognizedQuestionText(transcript: string, entries: VillageVoiceKnowledgeRow[]) {
+  const trimmed = transcript.trim();
+  if (!trimmed) return '';
+  // Convert a spoken word only when the whole transcript is that word. Keep
+  // full questions intact so “What does Mōra mean?” is not reduced to “Mōra”.
+  const normalizedTranscript = normalizeSpeechText(trimmed);
+  const candidates = [
+    ...words.map((word) => ({ phrase: word.native, aliases: [word.native, word.sound, word.meaning] })),
+    ...entries
+      .filter((entry) => entry.status === 'verified')
+      .map((entry) => ({
+        phrase: entry.phrase,
+        aliases: [entry.phrase, entry.pronunciation || '', ...answerVariations(entry.answerVariations), entry.meaning],
+      })),
+  ];
+  const exactMatch = candidates.find((candidate) => candidate.aliases.some((alias) => normalizeSpeechText(alias) === normalizedTranscript));
+  return exactMatch?.phrase || capitalizeTypedText(trimmed);
+}
+
+function questionIncludesAlias(question: string, alias: string) {
+  const normalizedQuestion = normalizeSpeechText(question);
+  const normalizedAlias = normalizeSpeechText(alias);
+  if (!normalizedAlias) return false;
+  return normalizedQuestion === normalizedAlias
+    || normalizedQuestion.includes(` ${normalizedAlias} `)
+    || normalizedQuestion.startsWith(`${normalizedAlias} `)
+    || normalizedQuestion.endsWith(` ${normalizedAlias}`);
 }
 
 function capitalizeTypedText(value: string) {
@@ -335,6 +373,33 @@ async function speakVillagePhrase(phrase: string, pronunciation?: string | null,
   }
 }
 
+async function playElderRecording(audioUrl: string) {
+  if (Platform.OS === 'web') {
+    await new Promise<void>((resolve, reject) => {
+      const audio = new globalThis.Audio(audioUrl);
+      audio.onended = () => resolve();
+      audio.onerror = () => reject(new Error('The elder recording could not be played.'));
+      void audio.play().catch(reject);
+    });
+    return;
+  }
+  const sound = new ExpoAudio.Sound();
+  try {
+    await sound.loadAsync({ uri: audioUrl }, { shouldPlay: true });
+    await new Promise<void>((resolve, reject) => {
+      sound.setOnPlaybackStatusUpdate((status) => {
+        if (!status.isLoaded) {
+          if (status.error) reject(new Error(status.error));
+          return;
+        }
+        if (status.didJustFinish) resolve();
+      });
+    });
+  } finally {
+    await sound.unloadAsync().catch(() => undefined);
+  }
+}
+
 export default function Home() {
   const [heard, setHeard] = useState<string | null>(null);
   const [isSignedIn, setIsSignedIn] = useState(false);
@@ -355,6 +420,15 @@ export default function Home() {
   const [recognitionLocale, setRecognitionLocale] = useState(RECOGNITION_LOCALE);
   const recognitionLocaleIndexRef = useRef(0);
   const recognitionFallbackAttemptedRef = useRef(false);
+  const voiceQuestionRef = useRef<string | null>(null);
+  const voiceSubmissionRef = useRef(false);
+  const askGuideRef = useRef<((promptOverride?: string) => Promise<void>) | null>(null);
+  const audioRecordingRef = useRef<ExpoAudio.Recording | null>(null);
+  const browserSpeechRecognitionRef = useRef<BrowserSpeechRecognizer | null>(null);
+  const browserElderRecorderRef = useRef<MediaRecorder | null>(null);
+  const browserElderChunksRef = useRef<Blob[]>([]);
+  const browserElderStreamRef = useRef<MediaStream | null>(null);
+  const [recordingEntryId, setRecordingEntryId] = useState<string | null>(null);
   const [playbackLength, setPlaybackLength] = useState<PlaybackLength>('normal');
   const [tutorError, setTutorError] = useState<string | null>(null);
   const [isAdmin, setIsAdmin] = useState(false);
@@ -397,13 +471,30 @@ export default function Home() {
   useSpeechRecognitionEvent('end', () => {
     setIsRecording(false);
     setIsTranscribing(false);
+    const spokenQuestion = voiceQuestionRef.current;
+    voiceQuestionRef.current = null;
+    if (spokenQuestion && !voiceSubmissionRef.current) {
+      voiceSubmissionRef.current = true;
+      setQuestion(spokenQuestion);
+      setTimeout(() => {
+        const submitQuestion = askGuideRef.current;
+        if (!submitQuestion) {
+          voiceSubmissionRef.current = false;
+          return;
+        }
+        void submitQuestion(spokenQuestion).finally(() => {
+          voiceSubmissionRef.current = false;
+        });
+      }, 0);
+    }
   });
 
   useSpeechRecognitionEvent('result', (event) => {
     const transcript = event.results?.[0]?.transcript?.trim();
     if (transcript) {
-      const recognized = recognizedVillagePhrase(transcript, adminEntries);
-      setQuestion(capitalizeTypedText(recognized));
+      const recognized = recognizedQuestionText(transcript, adminEntries);
+      voiceQuestionRef.current = recognized;
+      setQuestion(recognized);
       setRecognitionMode('offline');
     }
   });
@@ -447,6 +538,75 @@ export default function Home() {
     setIsTranscribing(false);
     setTutorError(event.message || `Free recognition was unavailable in ${recognitionLocale}. Try again, install Swahili or French speech support, or type the village phrase.`);
   });
+
+  useEffect(() => {
+    if (Platform.OS !== 'web' || typeof window === 'undefined') return;
+    const browserWindow = window as Window & {
+      SpeechRecognition?: new () => BrowserSpeechRecognizer;
+      webkitSpeechRecognition?: new () => BrowserSpeechRecognizer;
+    };
+    const BrowserRecognition = browserWindow.SpeechRecognition || browserWindow.webkitSpeechRecognition;
+    if (!BrowserRecognition) return;
+    const recognition = new BrowserRecognition();
+    recognition.continuous = false;
+    recognition.interimResults = true;
+    recognition.maxAlternatives = 3;
+    recognition.onresult = (event) => {
+      const result = event.results[event.resultIndex];
+      const transcript = result?.[0]?.transcript?.trim();
+      if (!transcript) return;
+      const recognized = recognizedQuestionText(transcript, adminEntries);
+      voiceQuestionRef.current = recognized;
+      setQuestion(recognized);
+      if (result.isFinal && !voiceSubmissionRef.current) {
+        voiceSubmissionRef.current = true;
+        setTimeout(() => {
+          const spokenQuestion = voiceQuestionRef.current;
+          voiceQuestionRef.current = null;
+          const submitQuestion = askGuideRef.current;
+          if (!spokenQuestion || !submitQuestion) {
+            voiceSubmissionRef.current = false;
+            return;
+          }
+          void submitQuestion(spokenQuestion).finally(() => {
+            voiceSubmissionRef.current = false;
+          });
+        }, 0);
+      }
+    };
+    recognition.onerror = (event) => {
+      setIsRecording(false);
+      setIsTranscribing(false);
+      setTutorError(event.message || `Browser recognition failed in ${recognitionLocale}. Try again or type the village phrase.`);
+    };
+    recognition.onend = () => {
+      setIsRecording(false);
+      setIsTranscribing(false);
+      if (!voiceSubmissionRef.current) {
+        const spokenQuestion = voiceQuestionRef.current;
+        voiceQuestionRef.current = null;
+        if (spokenQuestion) {
+          voiceSubmissionRef.current = true;
+          setQuestion(spokenQuestion);
+          setTimeout(() => {
+            const submitQuestion = askGuideRef.current;
+            if (!submitQuestion) {
+              voiceSubmissionRef.current = false;
+              return;
+            }
+            void submitQuestion(spokenQuestion).finally(() => {
+              voiceSubmissionRef.current = false;
+            });
+          }, 0);
+        }
+      }
+    };
+    browserSpeechRecognitionRef.current = recognition;
+    return () => {
+      recognition.stop();
+      browserSpeechRecognitionRef.current = null;
+    };
+  }, [adminEntries, recognitionLocale]);
 
   useEffect(() => {
     const unsubscribe = blink.auth.onAuthStateChanged((state) => {
@@ -705,6 +865,26 @@ export default function Home() {
     }
   };
 
+  const playCommunityEntry = async (entry: VillageVoiceKnowledgeRow) => {
+    impact();
+    setHeard(entry.phrase);
+    setSelectedPronunciationId(entry.id);
+    setIsSpeaking(true);
+    setTutorError(null);
+    try {
+      if (entry.audioUrl) {
+        await playElderRecording(entry.audioUrl);
+      } else {
+        await speakVillagePhrase(entry.phrase, entry.pronunciation, playbackLength);
+      }
+    } catch (error) {
+      setTutorError(readableError(error));
+    } finally {
+      setIsSpeaking(false);
+      setSelectedPronunciationId(null);
+    }
+  };
+
   const askGuide = async (promptOverride?: string) => {
     const trimmedQuestion = (promptOverride ?? question).trim();
     if (!trimmedQuestion || isThinking) return;
@@ -718,9 +898,17 @@ export default function Home() {
       const currentKnowledge = await readCurrentKnowledge();
       setAdminEntries(currentKnowledge);
       const safeQuestion = removeTrashFromText(trimmedQuestion, currentKnowledge);
-      const matchedEntry = currentKnowledge.find((entry) => entry.status === 'verified' && safeQuestion.toLocaleLowerCase().includes(entry.phrase.toLocaleLowerCase()));
+      const matchedEntry = currentKnowledge.find((entry) => entry.status === 'verified' && [
+        entry.phrase,
+        entry.pronunciation || '',
+        entry.meaning,
+        ...answerVariations(entry.answerVariations),
+      ].some((alias) => questionIncludesAlias(safeQuestion, alias)));
+      const matchedWord = words.find((word) => [word.native, word.sound, word.meaning].some((alias) => questionIncludesAlias(safeQuestion, alias)));
       const responseText = matchedEntry
         ? `${matchedEntry.phrase} means ${matchedEntry.meaning}${matchedEntry.pronunciation ? `. Say it like ${matchedEntry.pronunciation}.` : '.'} ${matchedEntry.context || 'Try using it in a warm village greeting.'}`
+        : matchedWord
+          ? `${matchedWord.native} means ${matchedWord.meaning}. Say it like ${matchedWord.sound}. Try it slowly, then listen for the rhythm.`
         : safeQuestion.toLocaleLowerCase().includes('hello') || safeQuestion.toLocaleLowerCase().includes('greet')
           ? 'Mōra means Hello. Try saying it slowly, then listen for the rhythm.'
           : safeQuestion.toLocaleLowerCase().includes('thank')
@@ -741,6 +929,8 @@ export default function Home() {
       setIsThinking(false);
     }
   };
+
+  askGuideRef.current = askGuide;
 
   const confirmKnowledgeEntry = async (entry: VillageVoiceKnowledgeRow, status: 'verified' | 'rejected') => {
     if (adminActionId) return;
@@ -777,13 +967,90 @@ export default function Home() {
     setAdminSpeakingId(entry.id);
     setAdminNotice(null);
     try {
-      await speakVillagePhrase(entry.phrase, entry.pronunciation, 'long');
-      await speakWithAvatar(`It means ${entry.meaning}. ${entry.context || ''}`, 0.8);
-      setAdminNotice(`Tavi read “${entry.phrase}” slowly and clearly. Confirm the sound and wording before marking it verified.`);
+      if (entry.audioUrl) {
+        await playElderRecording(entry.audioUrl);
+        setAdminNotice(`Authentic elder recording played for “${entry.phrase}”. This is the real community pronunciation.`);
+      } else {
+        await speakVillagePhrase(entry.phrase, entry.pronunciation, 'long');
+        await speakWithAvatar(`It means ${entry.meaning}. ${entry.context || ''}`, 0.8);
+        setAdminNotice(`No elder recording is attached yet. Tavi used the pronunciation guide only. Record this phrase below for authentic village speech.`);
+      }
     } catch (error) {
       setAdminNotice(readableError(error));
     } finally {
       setAdminSpeakingId(null);
+    }
+  };
+
+  const recordKnowledgeEntry = async (entry: VillageVoiceKnowledgeRow) => {
+    try {
+      if (Platform.OS === 'web') {
+        if (recordingEntryId === entry.id && browserElderRecorderRef.current) {
+          const recorder = browserElderRecorderRef.current;
+          browserElderRecorderRef.current = null;
+          recorder.stop();
+          browserElderStreamRef.current?.getTracks().forEach((track) => track.stop());
+          browserElderStreamRef.current = null;
+          setRecordingEntryId(null);
+          setAdminNotice('Uploading the elder recording securely…');
+          return;
+        }
+        if (browserElderRecorderRef.current) return;
+        if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+          throw new Error('This browser cannot record audio. Use the iOS or Android app for elder recording.');
+        }
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const recorder = new MediaRecorder(stream);
+        browserElderChunksRef.current = [];
+        recorder.ondataavailable = (event) => {
+          if (event.data.size > 0) browserElderChunksRef.current.push(event.data);
+        };
+        recorder.onstop = () => {
+          void (async () => {
+            const blob = new Blob(browserElderChunksRef.current, { type: recorder.mimeType || 'audio/webm' });
+            const file = new globalThis.File([blob], `elder-${entry.id}-${Date.now()}.webm`, { type: blob.type });
+            const uploaded = await blink.storage.upload(file, `village-audio/${entry.id}-${Date.now()}.webm`);
+            const updated = await knowledgeTable.update(entry.id, { audioUrl: uploaded.publicUrl, updatedAt: new Date().toISOString() });
+            setAdminEntries((current) => current.map((item) => item.id === updated.id ? updated : item));
+            setAdminNotice(`Real elder audio saved for “${entry.phrase}”. Learners will hear this recording instead of a synthetic voice.`);
+          })().catch((error) => setAdminNotice(readableError(error)));
+        };
+        browserElderRecorderRef.current = recorder;
+        browserElderStreamRef.current = stream;
+        recorder.start();
+        setRecordingEntryId(entry.id);
+        setAdminNotice(`Recording “${entry.phrase}”. Speak the complete village phrase naturally, then press Stop & save.`);
+        return;
+      }
+      if (recordingEntryId === entry.id && audioRecordingRef.current) {
+        const recording = audioRecordingRef.current;
+        audioRecordingRef.current = null;
+        await recording.stopAndUnloadAsync();
+        const uri = recording.getURI();
+        setRecordingEntryId(null);
+        await ExpoAudio.setAudioModeAsync({ allowsRecordingIOS: false, playsInSilentModeIOS: true });
+        if (!uri) throw new Error('The recording did not produce an audio file.');
+        setAdminNotice('Uploading the elder recording securely…');
+        const uploaded = await blink.storage.upload(new File(uri), `village-audio/${entry.id}-${Date.now()}.m4a`);
+        const updated = await knowledgeTable.update(entry.id, { audioUrl: uploaded.publicUrl, updatedAt: new Date().toISOString() });
+        setAdminEntries((current) => current.map((item) => item.id === updated.id ? updated : item));
+        setAdminNotice(`Real elder audio saved for “${entry.phrase}”. Learners will hear this recording instead of a synthetic voice.`);
+        return;
+      }
+      if (audioRecordingRef.current) return;
+      const permission = await ExpoAudio.requestPermissionsAsync();
+      if (!permission.granted) throw new Error('Allow microphone access to record the elder pronunciation.');
+      await ExpoAudio.setAudioModeAsync({ allowsRecordingIOS: true, playsInSilentModeIOS: true });
+      const recording = new ExpoAudio.Recording();
+      await recording.prepareToRecordAsync(ExpoAudio.RecordingOptionsPresets.HIGH_QUALITY);
+      await recording.startAsync();
+      audioRecordingRef.current = recording;
+      setRecordingEntryId(entry.id);
+      setAdminNotice(`Recording “${entry.phrase}”. Speak the complete village phrase naturally, then press Stop & save.`);
+    } catch (error) {
+      audioRecordingRef.current = null;
+      setRecordingEntryId(null);
+      setAdminNotice(readableError(error));
     }
   };
 
@@ -852,7 +1119,11 @@ export default function Home() {
   };
 
   const stopRecording = () => {
-    ExpoSpeechRecognitionModule.stop();
+    if (Platform.OS === 'web') {
+      browserSpeechRecognitionRef.current?.stop();
+    } else {
+      ExpoSpeechRecognitionModule.stop();
+    }
     setIsRecording(false);
     setIsTranscribing(false);
   };
@@ -861,6 +1132,20 @@ export default function Home() {
     if (isRecording || isTranscribing) return;
     setTutorError(null);
     try {
+      if (Platform.OS === 'web') {
+        const recognition = browserSpeechRecognitionRef.current;
+        if (!recognition) {
+          setTutorError('This browser does not provide speech recognition. Use a supported browser or type the phrase.');
+          return;
+        }
+        recognition.lang = conversationLanguage === 'swahili' ? 'sw-TZ' : RECOGNITION_LOCALE;
+        voiceQuestionRef.current = null;
+        setRecognitionMode('online');
+        setIsRecording(true);
+        setIsTranscribing(true);
+        recognition.start();
+        return;
+      }
       const permission = await ExpoSpeechRecognitionModule.requestPermissionsAsync();
       if (!permission.granted) {
         setTutorError('Allow microphone and speech recognition access to ask Tavi by voice.');
@@ -869,15 +1154,14 @@ export default function Home() {
       const recognitionLanguage = conversationLanguage === 'swahili' ? 'sw-TZ' : RECOGNITION_LOCALE;
       recognitionLocaleIndexRef.current = Math.max(0, ASIA_RECOGNITION_LOCALES.indexOf(recognitionLanguage));
       setRecognitionLocale(recognitionLanguage);
-      const offlineRecognition = Platform.OS !== 'web';
       recognitionFallbackAttemptedRef.current = false;
-      setRecognitionMode(offlineRecognition ? 'offline' : 'online');
+      setRecognitionMode('offline');
       ExpoSpeechRecognitionModule.start({
         lang: recognitionLanguage,
         interimResults: true,
         continuous: false,
         maxAlternatives: 3,
-        requiresOnDeviceRecognition: offlineRecognition,
+        requiresOnDeviceRecognition: true,
       });
       setIsTranscribing(true);
     } catch (error) {
@@ -889,6 +1173,9 @@ export default function Home() {
 
   useEffect(() => () => {
     ExpoSpeechRecognitionModule.abort();
+    browserSpeechRecognitionRef.current?.stop();
+    browserElderStreamRef.current?.getTracks().forEach((track) => track.stop());
+    if (audioRecordingRef.current) void audioRecordingRef.current.stopAndUnloadAsync().catch(() => undefined);
   }, []);
 
   const pendingAdminEntries = adminEntries.filter((entry) => entry.status === 'pending');
@@ -995,7 +1282,7 @@ export default function Home() {
               <SizableText size="$1" color="#46744F">Tavi reads the elder-approved pronunciation guide slowly, twice or three times. A device voice cannot guarantee a native accent; only elder-recorded audio can.</SizableText>
               {isThinking && <SizableText color="#8A542B">Tavi is thinking in {LANGUAGE_LABELS[conversationLanguage]}…</SizableText>}
               {isTranscribing && <SizableText color="#8A542B">Tavi is listening {recognitionMode === 'offline' ? 'offline on this device' : 'online in your browser'}…</SizableText>}
-              <SizableText size="$1" color="#46744F">Recognition is free. Tavi tries the device offline recognizer first, then free Swahili, French, and browser fallbacks. EBEMBE audio is learned from elder-approved pronunciation; no speech API can honestly guarantee 100% native recognition.</SizableText>
+              <SizableText size="$1" color="#46744F">Recognition is free. Tavi tries the device offline recognizer first, then free Swahili, French, and browser fallbacks. When an elder recording exists, learners hear that authentic village voice; otherwise the device voice is only a fallback.</SizableText>
               <XStack alignItems="center" gap="$2">
                 <Input flex={1} height={48} value={question} onChangeText={(value) => setQuestion(capitalizeTypedText(value))} autoCapitalize="sentences" placeholder={`Ask Tavi in ${LANGUAGE_LABELS[conversationLanguage]}…`} backgroundColor="#FFFDF7" borderColor="#D8C7B0" borderRadius="$4" color="#24362B" onSubmitEditing={() => askGuide()} />
                 <Button circular size="$5" backgroundColor={isRecording ? '#B45C4A' : '#E79A5A'} onPress={isRecording ? stopRecording : startRecording} disabled={isThinking || isTranscribing} aria-label={isRecording ? 'Stop microphone recording' : 'Microphone — ask by voice'} accessibilityLabel={isRecording ? 'Stop microphone recording' : 'Microphone — ask by voice'} accessibilityRole="button">
@@ -1028,6 +1315,7 @@ export default function Home() {
                 {studioAttachment && <YStack justifyContent="center" flex={1} minWidth={130}><SizableText size="$2" color="#FFFDF7" numberOfLines={1}>{studioAttachment.name}</SizableText><SizableText size="$1" color="#C9E3C5">Reference ready</SizableText></YStack>}
               </XStack>
               <SizableText size="$2" color="#C9E3C5">Type a creative brief and Tavi will turn verified community words into a free local lesson plan. Read each scene aloud with your device voice.</SizableText>
+              <SizableText size="$1" color="#F4C66A">Authentic village speech comes from elder recordings. Add those recordings in the private language lab; the free device voice is only a fallback.</SizableText>
             </YStack>
             <Button height={50} backgroundColor="#F4C66A" borderRadius="$4" onPress={() => void createStudioStory()} disabled={studioBusy}>
               <Play size={18} color="#24362B" /><SizableText color="#24362B" fontWeight="900">{studioBusy ? `Creating local scenes… ${studioProgress}%` : 'Create free lesson plan'}</SizableText>
@@ -1080,7 +1368,7 @@ export default function Home() {
               <YStack gap="$2">
                 <XStack alignItems="center" justifyContent="space-between">
                   <SizableText size="$2" color="#8A542B" fontWeight="900">REVIEW QUEUE · {pendingAdminEntries.length}</SizableText>
-                  <SizableText size="$1" color="#8A542B">Confirm or decline to move it out of this list</SizableText>
+                  <SizableText size="$1" color="#8A542B">Record authentic elder audio, then confirm or decline</SizableText>
                 </XStack>
                 {reviewEntries.map((entry) => editingEntryId === entry.id ? (
                   <YStack key={entry.id} gap="$2" backgroundColor="#FFFDF7" borderRadius="$4" padding="$3">
@@ -1103,9 +1391,10 @@ export default function Home() {
                   </YStack>
                 ) : (
                   <XStack key={entry.id} alignItems="center" justifyContent="space-between" gap="$2" backgroundColor="#FFFDF7" borderRadius="$4" padding="$3">
-                    <YStack flex={1} gap="$1"><SizableText color="#315C45" fontWeight="800">{entry.phrase}</SizableText><SizableText size="$2" color="#573E2A">{entry.meaning}{entry.pronunciation ? ` · ${entry.pronunciation}` : ''}</SizableText>{answerVariations(entry.answerVariations).length > 0 && <SizableText size="$2" color="#8A542B">Answers: {answerVariations(entry.answerVariations).join(' / ')}</SizableText>}<SizableText size="$1" color="#8A542B">PENDING — not used as truth</SizableText></YStack>
+                    <YStack flex={1} gap="$1"><SizableText color="#315C45" fontWeight="800">{entry.phrase}</SizableText><SizableText size="$2" color="#573E2A">{entry.meaning}{entry.pronunciation ? ` · ${entry.pronunciation}` : ''}</SizableText>{entry.audioUrl && <SizableText size="$1" color="#46744F">REAL ELDER AUDIO ATTACHED</SizableText>}{answerVariations(entry.answerVariations).length > 0 && <SizableText size="$2" color="#8A542B">Answers: {answerVariations(entry.answerVariations).join(' / ')}</SizableText>}<SizableText size="$1" color="#8A542B">PENDING — not used as truth</SizableText></YStack>
                     <XStack gap="$1" flexWrap="wrap" justifyContent="flex-end">
                       <Button height={38} paddingHorizontal="$2" backgroundColor={adminSpeakingId === entry.id ? '#5F936A' : '#E79A5A'} borderRadius="$3" onPress={() => void hearKnowledgeEntry(entry)} disabled={adminSpeakingId === entry.id} aria-label={`Hear ${entry.phrase}`}><Volume2 size={15} color="#FFFDF7" /></Button>
+                      <Button height={38} paddingHorizontal="$2" backgroundColor={recordingEntryId === entry.id ? '#B45C4A' : '#315C45'} borderRadius="$3" onPress={() => void recordKnowledgeEntry(entry)} aria-label={recordingEntryId === entry.id ? `Stop and save recording for ${entry.phrase}` : `Record elder pronunciation for ${entry.phrase}`}><SizableText color="#FFFDF7" fontWeight="800">{recordingEntryId === entry.id ? 'Stop & save' : 'Record elder'}</SizableText></Button>
                       <Button height={38} paddingHorizontal="$2" backgroundColor="#D8C7B0" borderRadius="$3" onPress={() => beginEditKnowledgeEntry(entry)} aria-label={`Edit ${entry.phrase}`}><Pencil size={15} color="#573E2A" /></Button>
                       <Button height={38} paddingHorizontal="$2" backgroundColor="#5F936A" borderRadius="$3" onPress={() => void confirmKnowledgeEntry(entry, 'verified')} disabled={adminActionId === entry.id} aria-label={`Confirm ${entry.phrase}`}><SizableText color="#FFFDF7" fontWeight="800">Confirm</SizableText></Button>
                       <Button height={38} paddingHorizontal="$2" backgroundColor="#B45C4A" borderRadius="$3" onPress={() => void confirmKnowledgeEntry(entry, 'rejected')} disabled={adminActionId === entry.id} aria-label={`Reject ${entry.phrase}`}><SizableText color="#FFFDF7" fontWeight="800">Decline</SizableText></Button>
@@ -1121,9 +1410,10 @@ export default function Home() {
                 </XStack>
                 {memoryEntries.filter((entry) => entry.id !== editingEntryId).map((entry) => (
                   <XStack key={`memory-${entry.id}`} alignItems="center" justifyContent="space-between" gap="$2" backgroundColor="#FFFDF7" borderRadius="$3" padding="$3">
-                    <YStack flex={1} gap="$1"><SizableText color="#315C45" fontWeight="800">{entry.phrase}</SizableText><SizableText size="$2" color="#573E2A">{entry.meaning}{entry.pronunciation ? ` · ${entry.pronunciation}` : ''}</SizableText>{answerVariations(entry.answerVariations).length > 0 && <SizableText size="$2" color="#46744F">Answers: {answerVariations(entry.answerVariations).join(' / ')}</SizableText>}<SizableText size="$1" color="#46744F">VERIFIED — included in every AI prompt</SizableText></YStack>
-                    <XStack gap="$1">
+                    <YStack flex={1} gap="$1"><SizableText color="#315C45" fontWeight="800">{entry.phrase}</SizableText><SizableText size="$2" color="#573E2A">{entry.meaning}{entry.pronunciation ? ` · ${entry.pronunciation}` : ''}</SizableText>{entry.audioUrl && <SizableText size="$1" color="#46744F">REAL ELDER AUDIO ATTACHED</SizableText>}{answerVariations(entry.answerVariations).length > 0 && <SizableText size="$2" color="#46744F">Answers: {answerVariations(entry.answerVariations).join(' / ')}</SizableText>}<SizableText size="$1" color="#46744F">VERIFIED — learners hear elder audio when attached</SizableText></YStack>
+                    <XStack gap="$1" flexWrap="wrap">
                       <Button height={38} paddingHorizontal="$2" backgroundColor={adminSpeakingId === entry.id ? '#5F936A' : '#E79A5A'} borderRadius="$3" onPress={() => void hearKnowledgeEntry(entry)} disabled={adminSpeakingId === entry.id} aria-label={`Hear memory ${entry.phrase}`}><Volume2 size={15} color="#FFFDF7" /></Button>
+                      <Button height={38} paddingHorizontal="$2" backgroundColor={recordingEntryId === entry.id ? '#B45C4A' : '#315C45'} borderRadius="$3" onPress={() => void recordKnowledgeEntry(entry)} aria-label={recordingEntryId === entry.id ? `Stop and save recording for ${entry.phrase}` : `Record elder pronunciation for ${entry.phrase}`}><SizableText color="#FFFDF7" fontWeight="800">{recordingEntryId === entry.id ? 'Stop & save' : 'Record elder'}</SizableText></Button>
                       <Button height={38} paddingHorizontal="$2" backgroundColor="#D8C7B0" borderRadius="$3" onPress={() => beginEditKnowledgeEntry(entry)} aria-label={`Edit memory ${entry.phrase}`}><Pencil size={15} color="#573E2A" /></Button>
                     </XStack>
                   </XStack>
@@ -1202,7 +1492,7 @@ export default function Home() {
               {memoryEntries.slice(0, 8).map((entry) => (
                 <XStack key={`verified-${entry.id}`} alignItems="center" justifyContent="space-between">
                   <XStack alignItems="center" gap="$3" flex={1}><YStack backgroundColor="#E8F1E4" borderRadius="$4" padding="$3" maxWidth="68%"><SizableText size="$4" fontWeight="800" color="#315C45" numberOfLines={2}>{entry.phrase}</SizableText></YStack><YStack flex={1}><SizableText fontWeight="700" color="#24362B">{entry.meaning}</SizableText><SizableText size="$2" color="#899087">{entry.pronunciation || 'Elder pronunciation not added yet'}</SizableText></YStack></XStack>
-                  <Button circular size="$4" chromeless backgroundColor={selectedPronunciationId === entry.id ? '#E79A5A' : '#F2EBDD'} onPress={() => { impact(); setHeard(entry.phrase); setSelectedPronunciationId(entry.id); setIsSpeaking(true); void speakVillagePhrase(entry.phrase, entry.pronunciation, playbackLength).catch((error) => setTutorError(readableError(error))).finally(() => { setIsSpeaking(false); setSelectedPronunciationId(null); }); }} aria-label={`Hear ${entry.phrase}`} accessibilityLabel={`Hear ${entry.phrase}`} accessibilityRole="button"><Volume2 size={19} color="#315C45" /></Button>
+                  <Button circular size="$4" chromeless backgroundColor={selectedPronunciationId === entry.id ? '#E79A5A' : '#F2EBDD'} onPress={() => void playCommunityEntry(entry)} aria-label={`Hear ${entry.phrase}`} accessibilityLabel={`Hear ${entry.phrase}`} accessibilityRole="button"><Volume2 size={19} color="#315C45" /></Button>
                 </XStack>
               ))}
               {heard && <SizableText color="#5F936A">Playing the clear device pronunciation for {heard}. Verified community words are read exactly as elders entered them.</SizableText>}
