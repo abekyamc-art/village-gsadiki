@@ -62,6 +62,14 @@
           "photosPermission": "Village Voice saves your completed Tavi story videos to your device.",
           "savePhotosPermission": "Village Voice saves your completed Tavi story videos to your device."
         }
+      ],
+      [
+        "expo-speech-recognition",
+        {
+          "microphonePermission": "Village Voice uses your microphone to recognize your question for Tavi.",
+          "speechRecognitionPermission": "Village Voice uses speech recognition to understand your question for Tavi.",
+          "androidSpeechServicePackages": ["com.google.android.googlequicksearchbox"]
+        }
       ]
     ],
     "experiments": {

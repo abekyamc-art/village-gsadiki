@@ -1,17 +1,16 @@
 import { useEffect, useRef, useState } from 'react';
-import type { VillageVoiceAdminMessagesRow, VillageVoiceCoinBalancesRow, VillageVoiceKnowledgeRow } from '@/lib/db-types';
+import type { VillageVoiceAdminMessagesRow, VillageVoiceKnowledgeRow } from '@/lib/db-types';
 import { Platform, AppState } from 'react-native';
 import * as Haptics from 'expo-haptics';
 import { useAnimatedStyle, useSharedValue, withRepeat, withSequence, withTiming } from 'react-native-reanimated';
-import { Audio as ExpoAudio } from 'expo-av';
-import { File } from 'expo-file-system';
 import * as ImagePicker from 'expo-image-picker';
+import { File } from 'expo-file-system';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Speech from 'expo-speech';
+import { ExpoSpeechRecognitionModule, useSpeechRecognitionEvent } from 'expo-speech-recognition';
 import { VideoView, useVideoPlayer } from 'expo-video';
 import { Image as ExpoImage } from 'expo-image';
 import { blink } from '@/lib/blink';
-import { identifyRevenueCatUser, purchaseCoinPackage, restoreCoinPurchases, useCoinMarket } from '@/lib/payments';
 import {
   ArrowRight,
   Check,
@@ -45,20 +44,11 @@ const AVATAR_URL = 'https://storage.googleapis.com/blink-core-storage/projects/v
 const TAVI_FULL_NAME = 'GLOIRE SADIKI MBEMBE MBONDO MWANA WA BASHIMNYAKA NYUMBA YA MMENDO ELEPONGAA';
 const ADMIN_USER_ID = 'Dc7JZfGsOOVdYYy5EQHZuVaPgv22';
 const AVATAR_GREETING = `Mōra, Amara. I am ${TAVI_FULL_NAME}, your Village Voice guide. Ask me about a word, a greeting, or the story behind our language.`;
-const FREE_AI_USES = 2;
-const AI_COIN_COST = 1;
-const FREE_AI_USES_KEY = 'village-voice-free-ai-uses';
 const STUDIO_CLIP_COUNT = 4;
-const STUDIO_PACK_INDEX = 1;
-const COIN_PACKS = [
-  { coins: 100, price: '$0.99' },
-  { coins: 500, price: '$3.99' },
-  { coins: 1200, price: '$7.99' },
-];
+const RECOGNITION_LOCALE = 'en-US';
 
 const knowledgeTable = blink.db.table<VillageVoiceKnowledgeRow>('village_voice_knowledge');
 const adminMessagesTable = blink.db.table<VillageVoiceAdminMessagesRow>('village_voice_admin_messages');
-const coinBalancesTable = blink.db.table<VillageVoiceCoinBalancesRow>('village_voice_coin_balances');
 
 type ConversationLanguage = 'community' | 'swahili' | 'english';
 type ConversationMode = 'chat' | 'joke' | 'story';
@@ -189,15 +179,6 @@ function capitalizeTypedText(value: string) {
   return value.charAt(0).toLocaleUpperCase() + value.slice(1);
 }
 
-async function blobToBase64(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve((reader.result as string).split(',')[1]);
-    reader.onerror = reject;
-    reader.readAsDataURL(blob);
-  });
-}
-
 const AVATAR_VIDEO_URL = 'https://storage.googleapis.com/blink-core-storage/projects/village-voice-app-kn8pvg1l/ai-videos/1789609115474-5905740c-b34c-4f02-8535-3c46a5e4e7bd.mp4';
 
 function AvatarStage({ isSpeaking }: { isSpeaking: boolean }) {
@@ -285,8 +266,6 @@ export default function Home() {
   const [authLoading, setAuthLoading] = useState(true);
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
-  const [freeUsesUsed, setFreeUsesUsed] = useState(0);
-  const [coinNotice, setCoinNotice] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [completed, setCompleted] = useState(false);
   const [question, setQuestion] = useState('');
@@ -312,7 +291,6 @@ export default function Home() {
   const [studioVideos, setStudioVideos] = useState<string[]>([]);
   const [studioBusy, setStudioBusy] = useState(false);
   const [studioProgress, setStudioProgress] = useState(0);
-  const [studioUnlocked, setStudioUnlocked] = useState(true);
   const [studioNotice, setStudioNotice] = useState<string | null>(null);
   const [studioError, setStudioError] = useState<string | null>(null);
   const [studioDownloadBusy, setStudioDownloadBusy] = useState(false);
@@ -322,21 +300,33 @@ export default function Home() {
   const [profileBusy, setProfileBusy] = useState(false);
   const [profileNotice, setProfileNotice] = useState<string | null>(null);
   const [appTheme, setAppTheme] = useState<AppTheme>('light');
-  const [coinBalance, setCoinBalance] = useState(0);
-  const [coinBalanceLoading, setCoinBalanceLoading] = useState(false);
-  const [coinBalanceError, setCoinBalanceError] = useState<string | null>(null);
-  const [walletOpen, setWalletOpen] = useState(false);
   const [adminEntryForm, setAdminEntryForm] = useState({ phrase: '', meaning: '', pronunciation: '', context: '', answerVariations: '' });
   const [adminEditForm, setAdminEditForm] = useState({ phrase: '', meaning: '', pronunciation: '', context: '', answerVariations: '' });
   const isAdminRef = useRef(false);
-  const browserRecorderRef = useRef<MediaRecorder | null>(null);
-  const nativeRecorderRef = useRef<ExpoAudio.Recording | null>(null);
-  const recordingStreamRef = useRef<MediaStream | null>(null);
-  const recordingChunksRef = useRef<Blob[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([
     { role: 'assistant', content: AVATAR_GREETING },
   ]);
-  const { packages: coinPackages, isLoading: coinMarketLoading, error: coinMarketError, refresh: refreshCoinMarket } = useCoinMarket(isSignedIn);
+
+  useSpeechRecognitionEvent('start', () => {
+    setIsRecording(true);
+    setIsTranscribing(true);
+  });
+
+  useSpeechRecognitionEvent('end', () => {
+    setIsRecording(false);
+    setIsTranscribing(false);
+  });
+
+  useSpeechRecognitionEvent('result', (event) => {
+    const transcript = event.results?.[0]?.transcript?.trim();
+    if (transcript) setQuestion(capitalizeTypedText(transcript));
+  });
+
+  useSpeechRecognitionEvent('error', (event) => {
+    setIsRecording(false);
+    setIsTranscribing(false);
+    setTutorError(event.message || 'Tavi could not hear that. Please try again or type your question.');
+  });
 
   useEffect(() => {
     const unsubscribe = blink.auth.onAuthStateChanged((state) => {
@@ -346,13 +336,9 @@ export default function Home() {
         const nextProfile = { displayName: state.user.displayName };
         setProfile(nextProfile);
         setProfileName(state.user.displayName || '');
-        void AsyncStorage.getItem(`${FREE_AI_USES_KEY}-${state.user.id}`).then((saved) => {
-          setFreeUsesUsed(Math.min(FREE_AI_USES, Number(saved) || 0));
-        });
       } else {
         setProfile({});
         setProfileName('');
-        setFreeUsesUsed(0);
       }
       if (!state.isLoading) setAuthLoading(false);
     });
@@ -366,29 +352,10 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    void identifyRevenueCatUser(currentUserId);
-  }, [currentUserId]);
-
-  useEffect(() => {
     let cancelled = false;
     if (!currentUserId) {
-      setCoinBalance(0);
-      setCoinBalanceError(null);
-      setCoinBalanceLoading(false);
       return () => { cancelled = true; };
     }
-    setCoinBalanceLoading(true);
-    setCoinBalanceError(null);
-    void coinBalancesTable.list({ where: { userId: currentUserId }, limit: 1 })
-      .then((rows) => {
-        if (!cancelled) setCoinBalance(Number(rows[0]?.coins ?? 0));
-      })
-      .catch((error) => {
-        if (!cancelled) setCoinBalanceError(readableError(error));
-      })
-      .finally(() => {
-        if (!cancelled) setCoinBalanceLoading(false);
-      });
     return () => { cancelled = true; };
   }, [currentUserId]);
 
@@ -462,38 +429,6 @@ export default function Home() {
     setSelected(answer);
   };
 
-  const buyCoinPackage = async (packageIndex: number) => {
-    const packageToBuy = coinPackages[packageIndex];
-    if (!packageToBuy) return;
-    impact();
-    setCoinNotice(null);
-    try {
-      const result = await purchaseCoinPackage(packageToBuy);
-      const coins = packageIndex === 0 ? 100 : packageIndex === 1 ? 500 : 1200;
-      setCoinNotice(`${coins.toLocaleString()} coins purchased. Your balance will update after the secure receipt is confirmed.`);
-      if (result.customerInfo) {
-        await refreshCoinMarket();
-        setTimeout(() => {
-          void coinBalancesTable.list({ where: { userId: currentUserId ?? '' }, limit: 1 })
-            .then((rows) => setCoinBalance(Number(rows[0]?.coins ?? 0)))
-            .catch(() => undefined);
-        }, 1000);
-      }
-    } catch (error) {
-      setCoinNotice(readableError(error));
-    }
-  };
-
-  const restoreCoins = async () => {
-    impact();
-    try {
-      await restoreCoinPurchases();
-      setCoinNotice('Your purchases have been restored.');
-    } catch (error) {
-      setCoinNotice(readableError(error));
-    }
-  };
-
   const saveProfile = async () => {
     const name = profileName.trim();
     if (!name) {
@@ -539,23 +474,6 @@ export default function Home() {
     }
   };
 
-  const unlockStudio = async () => {
-    if (!isSignedIn) {
-      setStudioError('Sign in before unlocking Tavi Story Studio.');
-      return;
-    }
-    setStudioError(null);
-    setStudioNotice(null);
-    try {
-      if (!coinPackages[STUDIO_PACK_INDEX]) throw new Error('The 500-coin Story Studio pack is not available yet.');
-      await buyCoinPackage(STUDIO_PACK_INDEX);
-      setStudioUnlocked(true);
-      setStudioNotice('Story Studio unlocked with the 500-coin premium pack.');
-    } catch (error) {
-      setStudioError(readableError(error));
-    }
-  };
-
   const pickStudioAttachment = async () => {
     if (!isSignedIn) {
       setStudioError('Sign in before uploading a photo or video for Tavi.');
@@ -591,10 +509,6 @@ export default function Home() {
   const createStudioStory = async () => {
     if (!isSignedIn) {
       setStudioError('Sign in before creating a Tavi story lesson.');
-      return;
-    }
-    if (!studioUnlocked) {
-      setStudioError('Unlock Story Studio with the 500-coin premium pack before creating.');
       return;
     }
     const brief = studioPrompt.trim() || 'Create a warm village story that teaches a simple greeting to a learner.';
@@ -669,23 +583,6 @@ export default function Home() {
     } finally {
       setIsSpeaking(false);
     }
-  };
-
-  const consumeCoin = async () => {
-    if (!currentUserId) return false;
-    const rows = await coinBalancesTable.list({ where: { userId: currentUserId }, limit: 1 });
-    const balance = rows[0];
-    const available = Number(balance?.coins ?? coinBalance);
-    if (!balance || available < AI_COIN_COST) return false;
-    await coinBalancesTable.update(balance.id, { coins: available - AI_COIN_COST, updatedAt: new Date().toISOString() });
-    setCoinBalance(available - AI_COIN_COST);
-    return true;
-  };
-
-  const markFreeUse = async () => {
-    const next = Math.min(FREE_AI_USES, freeUsesUsed + 1);
-    setFreeUsesUsed(next);
-    if (currentUserId) await AsyncStorage.setItem(`${FREE_AI_USES_KEY}-${currentUserId}`, String(next));
   };
 
   const askGuide = async (promptOverride?: string) => {
@@ -834,117 +731,39 @@ export default function Home() {
     }
   };
 
-  const transcribeAudioInput = async (_audio: string) => {
+  const stopRecording = () => {
+    ExpoSpeechRecognitionModule.stop();
+    setIsRecording(false);
     setIsTranscribing(false);
-    setTutorError('Voice-to-text is disabled to keep Village Voice completely free of hosted AI charges. Type your question instead.');
-  };
-
-  const stopRecording = async () => {
-    if (Platform.OS === 'web') {
-      const recorder = browserRecorderRef.current;
-      if (!recorder || recorder.state === 'inactive') {
-        setIsRecording(false);
-        return;
-      }
-      recorder.stop();
-      recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
-      recordingStreamRef.current = null;
-      setIsRecording(false);
-      return;
-    }
-
-    const recording = nativeRecorderRef.current;
-    if (!recording) {
-      setIsRecording(false);
-      return;
-    }
-    try {
-      await recording.stopAndUnloadAsync();
-      nativeRecorderRef.current = null;
-      const uri = recording.getURI();
-      if (!uri) throw new Error('The recording did not produce an audio file.');
-      const audio = await new File(uri).base64();
-      if (!audio) throw new Error('The recording was empty. Please try again.');
-      await transcribeAudioInput(audio);
-    } catch (error) {
-      setTutorError(readableError(error));
-      setIsTranscribing(false);
-    } finally {
-      setIsRecording(false);
-      await ExpoAudio.setAudioModeAsync({ allowsRecordingIOS: false, playsInSilentModeIOS: true }).catch(() => undefined);
-    }
   };
 
   const startRecording = async () => {
     if (isRecording || isTranscribing) return;
-    setTutorError('Voice-to-text is disabled to keep Village Voice completely free of hosted AI charges. Type your question instead.');
-    return;
-    if (!isSignedIn && freeUsesUsed >= FREE_AI_USES) {
-      setAuthError('Your two free questions are used. Continue with Google to keep learning with Tavi.');
-      await signInWithGoogle();
-      return;
-    }
-    if (isSignedIn && freeUsesUsed >= FREE_AI_USES && coinBalance < AI_COIN_COST) {
-      setCoinNotice('Add coins in Wallet before recording another question.');
-      setWalletOpen(true);
-      return;
-    }
     setTutorError(null);
     try {
-      if (Platform.OS !== 'web') {
-        const permission = await ExpoAudio.requestPermissionsAsync();
-        if (!permission.granted) {
-          setTutorError('Allow microphone access in your phone settings to speak with Tavi.');
-          return;
-        }
-        await ExpoAudio.setAudioModeAsync({ allowsRecordingIOS: true, playsInSilentModeIOS: true });
-        const recording = new ExpoAudio.Recording();
-        await recording.prepareToRecordAsync(ExpoAudio.RecordingOptionsPresets.HIGH_QUALITY);
-        await recording.startAsync();
-        nativeRecorderRef.current = recording;
-        setIsRecording(true);
+      const permission = await ExpoSpeechRecognitionModule.requestPermissionsAsync();
+      if (!permission.granted) {
+        setTutorError('Allow microphone and speech recognition access to ask Tavi by voice.');
         return;
       }
-
-      if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
-        setTutorError('This browser does not support microphone questions.');
-        return;
-      }
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const recorder = new MediaRecorder(stream);
-      recordingStreamRef.current = stream;
-      browserRecorderRef.current = recorder;
-      recordingChunksRef.current = [];
-      recorder.ondataavailable = (event) => {
-        if (event.data.size > 0) recordingChunksRef.current.push(event.data);
-      };
-      recorder.onstop = async () => {
-        try {
-          const blob = new Blob(recordingChunksRef.current, { type: recorder.mimeType || 'audio/webm' });
-          if (blob.size === 0) throw new Error('The recording was empty. Please try again.');
-          await transcribeAudioInput(await blobToBase64(blob));
-        } catch (error) {
-          setTutorError(readableError(error));
-          setIsTranscribing(false);
-        } finally {
-          recordingChunksRef.current = [];
-          browserRecorderRef.current = null;
-          recordingStreamRef.current = null;
-        }
-      };
-      recorder.start();
-      setIsRecording(true);
+      const recognitionLanguage = conversationLanguage === 'swahili' ? 'sw-TZ' : RECOGNITION_LOCALE;
+      ExpoSpeechRecognitionModule.start({
+        lang: recognitionLanguage,
+        interimResults: true,
+        continuous: false,
+        maxAlternatives: 3,
+        requiresOnDeviceRecognition: false,
+      });
+      setIsTranscribing(true);
     } catch (error) {
       setTutorError(readableError(error));
       setIsRecording(false);
+      setIsTranscribing(false);
     }
   };
 
   useEffect(() => () => {
-    browserRecorderRef.current?.stop();
-    recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
-    const recording = nativeRecorderRef.current;
-    if (recording) void recording.stopAndUnloadAsync();
+    ExpoSpeechRecognitionModule.abort();
   }, []);
 
   const pendingAdminEntries = adminEntries.filter((entry) => entry.status === 'pending');
@@ -1058,9 +877,9 @@ export default function Home() {
           <Card backgroundColor="#24362B" borderColor="#C97935" borderWidth={1} borderRadius="$6" padding="$4" gap="$4">
             <XStack alignItems="center" justifyContent="space-between" gap="$3">
               <YStack flex={1} gap="$1">
-                <SizableText size="$2" color="#F4C66A" fontWeight="900">PREMIUM · 500 COINS</SizableText>
+                <SizableText size="$2" color="#F4C66A" fontWeight="900">FREE LOCAL LESSON MAKER</SizableText>
                 <H2 color="#FFFDF7" fontSize={25}>Tavi Story Studio</H2>
-                <Paragraph color="#E2EFE0" size="$3">Create a connected 48-second lesson with Tavi speaking EBEMBE and a little Swahili.</Paragraph>
+                <Paragraph color="#E2EFE0" size="$3">Create a connected lesson plan with verified EBEMBE words and your device voice — no coins or hosted AI generation.</Paragraph>
               </YStack>
               <YStack backgroundColor="#E79A5A" borderRadius="$10" padding="$3"><Play size={22} color="#FFFDF7" /></YStack>
             </XStack>
@@ -1075,15 +894,9 @@ export default function Home() {
               </XStack>
               <SizableText size="$2" color="#C9E3C5">Type a creative brief and Tavi will turn verified community words into a free local lesson plan. Read each scene aloud with your device voice.</SizableText>
             </YStack>
-            {!studioUnlocked ? (
-              <Button height={50} backgroundColor="#E79A5A" borderRadius="$4" onPress={() => void unlockStudio()} disabled={studioBusy || coinMarketLoading}>
-              <LockKeyhole size={18} color="#FFFDF7" /><SizableText color="#FFFDF7" fontWeight="900">Create free local lesson</SizableText>
-              </Button>
-            ) : (
-              <Button height={50} backgroundColor="#F4C66A" borderRadius="$4" onPress={() => void createStudioStory()} disabled={studioBusy}>
-                <Play size={18} color="#24362B" /><SizableText color="#24362B" fontWeight="900">{studioBusy ? `Creating local scenes… ${studioProgress}%` : 'Create free lesson plan'}</SizableText>
-              </Button>
-            )}
+            <Button height={50} backgroundColor="#F4C66A" borderRadius="$4" onPress={() => void createStudioStory()} disabled={studioBusy}>
+              <Play size={18} color="#24362B" /><SizableText color="#24362B" fontWeight="900">{studioBusy ? `Creating local scenes… ${studioProgress}%` : 'Create free lesson plan'}</SizableText>
+            </Button>
             {studioBusy && <Progress value={studioProgress} backgroundColor="#50755D" height={8} borderRadius="$10"><Progress.Indicator backgroundColor="#F4C66A" animation="bouncy" /></Progress>}
             {studioAnalysis && <YStack backgroundColor="#FFFDF7" borderRadius="$3" padding="$3"><SizableText size="$2" color="#573E2A" fontWeight="800">TAVI RECOGNIZED</SizableText><SizableText size="$2" color="#573E2A">{studioAnalysis}</SizableText></YStack>}
             {studioNotice && <SizableText size="$2" color="#F4C66A">{studioNotice}</SizableText>}
@@ -1206,36 +1019,6 @@ export default function Home() {
                 </XStack>
               </YStack>
               {adminNotice && <SizableText size="$2" color="#8A542B">{adminNotice}</SizableText>}
-            </Card>
-          )}
-          {isSignedIn && !authLoading && (
-            <Card backgroundColor="#FFF1D1" borderColor="#F4C66A" borderWidth={1} borderRadius="$5" padding="$4" gap="$3">
-              <XStack alignItems="center" justifyContent="space-between">
-                <YStack gap="$1"><SizableText size="$2" color="#8A542B" fontWeight="800">WALLET</SizableText><H3 color="#573E2A">Keep your Tavi balance ready</H3></YStack>
-                <SizableText size="$6" color="#C97935" fontWeight="900">{coinBalanceLoading ? '…' : coinBalance.toLocaleString()}</SizableText>
-              </XStack>
-              <Button height={44} backgroundColor="#315C45" borderRadius="$4" onPress={() => setWalletOpen((open) => !open)}>
-                <SizableText color="#FFFDF7" fontWeight="900">{walletOpen ? 'Hide coin packs' : 'Open wallet · Buy coins'}</SizableText>
-              </Button>
-              <Paragraph color="#765F4B">Tavi now runs locally with no Blink AI charges. Coins remain available for future premium app features.</Paragraph>
-              {walletOpen && (
-                <YStack gap="$3">
-                  {coinBalanceError && <SizableText size="$2" color="#B45C4A">{coinBalanceError}</SizableText>}
-                  <XStack gap="$2" flexWrap="wrap">
-                    {(coinPackages.length ? coinPackages : [null, null, null]).map((coinPackage, index) => (
-                      <Button key={coinPackage?.identifier ?? `coin-placeholder-${index}`} flex={1} minWidth={92} height={58} backgroundColor="#E79A5A" borderRadius="$4" onPress={() => void buyCoinPackage(index)} disabled={!coinPackage || coinMarketLoading}>
-                        <YStack alignItems="center" gap="$1"><SizableText size="$2" color="#FFFDF7" fontWeight="800">{COIN_PACKS[index].coins.toLocaleString()}</SizableText><SizableText size="$1" color="#FFFDF7">{coinPackage?.product.priceString ?? (coinMarketLoading ? 'Loading…' : 'Unavailable')}</SizableText></YStack>
-                      </Button>
-                    ))}
-                  </XStack>
-                  <XStack alignItems="center" justifyContent="space-between">
-                    <Button chromeless onPress={() => void restoreCoins()}><SizableText size="$2" color="#8A542B" fontWeight="700">Restore purchases</SizableText></Button>
-                    <Button chromeless onPress={() => void refreshCoinMarket()}><SizableText size="$2" color="#8A542B" fontWeight="700">Refresh packs</SizableText></Button>
-                  </XStack>
-                  {coinMarketError && <SizableText size="$2" color="#8A542B">{coinMarketError}</SizableText>}
-                  {coinNotice && <SizableText size="$2" color="#8A542B">{coinNotice}</SizableText>}
-                </YStack>
-              )}
             </Card>
           )}
           {isSignedIn && !authLoading && (
