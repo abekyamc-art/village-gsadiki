@@ -46,8 +46,10 @@ const ADMIN_USER_ID = 'Dc7JZfGsOOVdYYy5EQHZuVaPgv22';
 const AVATAR_GREETING = `Mōra, Amara. I am ${TAVI_FULL_NAME}, your Village Voice guide. Ask me about a word, a greeting, or the story behind our language.`;
 const STUDIO_CLIP_COUNT = 4;
 const RECOGNITION_LOCALE = 'en-US';
+const ASIA_RECOGNITION_LOCALES = ['sw-TZ', 'sw-KE', 'fr-FR', 'en-US'];
 
 type RecognitionMode = 'offline' | 'online';
+type PlaybackLength = 'short' | 'normal' | 'long';
 
 const knowledgeTable = blink.db.table<VillageVoiceKnowledgeRow>('village_voice_knowledge');
 const adminMessagesTable = blink.db.table<VillageVoiceAdminMessagesRow>('village_voice_admin_messages');
@@ -316,12 +318,20 @@ async function speakWithAvatar(text: string, rate = 0.88) {
   await speakDeviceText(text, rate);
 }
 
-async function speakVillagePhrase(phrase: string, pronunciation?: string | null) {
+function pronunciationText(phrase: string, pronunciation?: string | null) {
+  return pronunciation?.trim() && pronunciation.trim().toLocaleLowerCase() !== phrase.trim().toLocaleLowerCase()
+    ? pronunciation.trim()
+    : phrase.trim();
+}
+
+async function speakVillagePhrase(phrase: string, pronunciation?: string | null, length: PlaybackLength = 'normal') {
   await Speech.stop();
-  await speakDeviceText(phrase, 0.66);
-  if (pronunciation?.trim()) {
-    await new Promise((resolve) => setTimeout(resolve, 180));
-    await speakDeviceText(pronunciation.replace(/[|/]/g, ' '), 0.5);
+  const spoken = pronunciationText(phrase, pronunciation);
+  const rate = length === 'long' ? 0.48 : length === 'short' ? 0.72 : 0.58;
+  const repeats = length === 'long' ? 3 : length === 'short' ? 1 : 2;
+  for (let index = 0; index < repeats; index += 1) {
+    await speakDeviceText(spoken, rate);
+    if (index < repeats - 1) await new Promise((resolve) => setTimeout(resolve, length === 'long' ? 380 : 220));
   }
 }
 
@@ -342,7 +352,10 @@ export default function Home() {
   const [isRecording, setIsRecording] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [recognitionMode, setRecognitionMode] = useState<RecognitionMode>('offline');
+  const [recognitionLocale, setRecognitionLocale] = useState(RECOGNITION_LOCALE);
+  const recognitionLocaleIndexRef = useRef(0);
   const recognitionFallbackAttemptedRef = useRef(false);
+  const [playbackLength, setPlaybackLength] = useState<PlaybackLength>('normal');
   const [tutorError, setTutorError] = useState<string | null>(null);
   const [isAdmin, setIsAdmin] = useState(false);
   const [adminEntries, setAdminEntries] = useState<VillageVoiceKnowledgeRow[]>([]);
@@ -363,6 +376,7 @@ export default function Home() {
   const [studioError, setStudioError] = useState<string | null>(null);
   const [studioDownloadBusy, setStudioDownloadBusy] = useState(false);
   const [editingEntryId, setEditingEntryId] = useState<string | null>(null);
+  const [selectedPronunciationId, setSelectedPronunciationId] = useState<string | null>(null);
   const [profile, setProfile] = useState<UserProfile>({});
   const [profileName, setProfileName] = useState('');
   const [profileBusy, setProfileBusy] = useState(false);
@@ -397,10 +411,28 @@ export default function Home() {
   useSpeechRecognitionEvent('error', (event) => {
     if (recognitionMode === 'offline' && Platform.OS !== 'web' && !recognitionFallbackAttemptedRef.current) {
       recognitionFallbackAttemptedRef.current = true;
+      const nextLocaleIndex = recognitionLocaleIndexRef.current + 1;
+      if (nextLocaleIndex < ASIA_RECOGNITION_LOCALES.length) {
+        const nextLocale = ASIA_RECOGNITION_LOCALES[nextLocaleIndex];
+        recognitionLocaleIndexRef.current = nextLocaleIndex;
+        setRecognitionLocale(nextLocale);
+        try {
+          ExpoSpeechRecognitionModule.start({
+            lang: nextLocale,
+            interimResults: true,
+            continuous: false,
+            maxAlternatives: 3,
+            requiresOnDeviceRecognition: true,
+          });
+          return;
+        } catch {
+          // Continue to the free online fallback below.
+        }
+      }
       setRecognitionMode('online');
       try {
         ExpoSpeechRecognitionModule.start({
-          lang: conversationLanguage === 'swahili' ? 'sw-TZ' : RECOGNITION_LOCALE,
+          lang: recognitionLocale,
           interimResults: true,
           continuous: false,
           maxAlternatives: 3,
@@ -413,7 +445,7 @@ export default function Home() {
     }
     setIsRecording(false);
     setIsTranscribing(false);
-    setTutorError(event.message || 'Offline recognition was unavailable. Tavi tried the free browser/device fallback; please try again or type the word.');
+    setTutorError(event.message || `Free recognition was unavailable in ${recognitionLocale}. Try again, install Swahili or French speech support, or type the village phrase.`);
   });
 
   useEffect(() => {
@@ -665,7 +697,7 @@ export default function Home() {
     setIsSpeaking(true);
     setTutorError(null);
     try {
-      await speakWithAvatar(text);
+      await speakWithAvatar(text, playbackLength === 'long' ? 0.72 : playbackLength === 'short' ? 0.94 : 0.88);
     } catch (error) {
       setTutorError(readableError(error));
     } finally {
@@ -745,8 +777,8 @@ export default function Home() {
     setAdminSpeakingId(entry.id);
     setAdminNotice(null);
     try {
-      await speakVillagePhrase(entry.phrase, entry.pronunciation);
-      await speakWithAvatar(`It means ${entry.meaning}. ${entry.context || ''}`);
+      await speakVillagePhrase(entry.phrase, entry.pronunciation, 'long');
+      await speakWithAvatar(`It means ${entry.meaning}. ${entry.context || ''}`, 0.8);
       setAdminNotice(`Tavi read “${entry.phrase}” slowly and clearly. Confirm the sound and wording before marking it verified.`);
     } catch (error) {
       setAdminNotice(readableError(error));
@@ -835,6 +867,8 @@ export default function Home() {
         return;
       }
       const recognitionLanguage = conversationLanguage === 'swahili' ? 'sw-TZ' : RECOGNITION_LOCALE;
+      recognitionLocaleIndexRef.current = Math.max(0, ASIA_RECOGNITION_LOCALES.indexOf(recognitionLanguage));
+      setRecognitionLocale(recognitionLanguage);
       const offlineRecognition = Platform.OS !== 'web';
       recognitionFallbackAttemptedRef.current = false;
       setRecognitionMode(offlineRecognition ? 'offline' : 'online');
@@ -942,6 +976,14 @@ export default function Home() {
                   </Button>
                 ))}
               </XStack>
+              <XStack alignItems="center" gap="$2" flexWrap="wrap">
+                <SizableText size="$2" color="#8A542B" fontWeight="800">READING LENGTH</SizableText>
+                {(['short', 'normal', 'long'] as PlaybackLength[]).map((length) => (
+                  <Button key={length} height={34} paddingHorizontal="$3" borderRadius="$10" backgroundColor={playbackLength === length ? '#5F936A' : '#F5EBDD'} onPress={() => setPlaybackLength(length)}>
+                    <SizableText size="$2" color={playbackLength === length ? '#FFFDF7' : '#573E2A'} fontWeight="700">{length === 'short' ? 'Short' : length === 'normal' ? 'Normal' : 'Long practice'}</SizableText>
+                  </Button>
+                ))}
+              </XStack>
               {messages.slice(-3).map((message, index) => (
                 <XStack key={`${message.role}-${index}`} justifyContent={message.role === 'user' ? 'flex-end' : 'flex-start'}>
                   <YStack maxWidth="88%" backgroundColor={message.role === 'user' ? '#315C45' : '#FFFDF7'} borderRadius="$4" padding="$3">
@@ -950,9 +992,10 @@ export default function Home() {
                 </XStack>
               ))}
               <SizableText size="$2" color="#8A542B">Free local guide answers: unlimited · no Blink AI credits used.</SizableText>
+              <SizableText size="$1" color="#46744F">Tavi reads the elder-approved pronunciation guide slowly, twice or three times. A device voice cannot guarantee a native accent; only elder-recorded audio can.</SizableText>
               {isThinking && <SizableText color="#8A542B">Tavi is thinking in {LANGUAGE_LABELS[conversationLanguage]}…</SizableText>}
               {isTranscribing && <SizableText color="#8A542B">Tavi is listening {recognitionMode === 'offline' ? 'offline on this device' : 'online in your browser'}…</SizableText>}
-              <SizableText size="$1" color="#46744F">Recognition is free. On supported phones, offline mode keeps village-word practice on your device; the browser uses its built-in online recognizer.</SizableText>
+              <SizableText size="$1" color="#46744F">Recognition is free. Tavi tries the device offline recognizer first, then free Swahili, French, and browser fallbacks. EBEMBE audio is learned from elder-approved pronunciation; no speech API can honestly guarantee 100% native recognition.</SizableText>
               <XStack alignItems="center" gap="$2">
                 <Input flex={1} height={48} value={question} onChangeText={(value) => setQuestion(capitalizeTypedText(value))} autoCapitalize="sentences" placeholder={`Ask Tavi in ${LANGUAGE_LABELS[conversationLanguage]}…`} backgroundColor="#FFFDF7" borderColor="#D8C7B0" borderRadius="$4" color="#24362B" onSubmitEditing={() => askGuide()} />
                 <Button circular size="$5" backgroundColor={isRecording ? '#B45C4A' : '#E79A5A'} onPress={isRecording ? stopRecording : startRecording} disabled={isThinking || isTranscribing} aria-label={isRecording ? 'Stop microphone recording' : 'Microphone — ask by voice'} accessibilityLabel={isRecording ? 'Stop microphone recording' : 'Microphone — ask by voice'} accessibilityRole="button">
@@ -1148,18 +1191,18 @@ export default function Home() {
           </XStack>
 
           <YStack gap="$3">
-            <XStack alignItems="center" justifyContent="space-between"><H3 color="#24362B">Hear it in context</H3><SizableText color="#C97935" fontWeight="700">Pronunciation guide</SizableText></XStack>
+            <XStack alignItems="center" justifyContent="space-between"><H3 color="#24362B">Hear it in context</H3><SizableText color="#C97935" fontWeight="700">Elder-approved pronunciation</SizableText></XStack>
             <Card backgroundColor="#FFFDF7" borderColor="#E7E1D3" borderWidth={1} borderRadius="$5" padding="$4" gap="$4">
               {words.map((word) => (
                 <XStack key={word.native} alignItems="center" justifyContent="space-between">
                   <XStack alignItems="center" gap="$3"><YStack backgroundColor="#E8F1E4" borderRadius="$4" padding="$3"><SizableText size="$5" fontWeight="800" color="#315C45">{word.native}</SizableText></YStack><YStack><SizableText fontWeight="700" color="#24362B">{word.meaning}</SizableText><SizableText size="$2" color="#899087">{word.sound}</SizableText></YStack></XStack>
-                  <Button circular size="$4" chromeless backgroundColor={heard === word.native ? '#E79A5A' : '#F2EBDD'} onPress={() => { impact(); setHeard(word.native); setIsSpeaking(true); void speakVillagePhrase(word.native, word.sound).catch((error) => setTutorError(readableError(error))).finally(() => setIsSpeaking(false)); }} aria-label={`Hear ${word.native}`} accessibilityLabel={`Hear ${word.native}`} accessibilityRole="button"><Volume2 size={19} color={heard === word.native ? '#FFFDF7' : '#315C45'} /></Button>
+                  <Button circular size="$4" chromeless backgroundColor={heard === word.native ? '#E79A5A' : '#F2EBDD'} onPress={() => { impact(); setHeard(word.native); setSelectedPronunciationId(word.native); setIsSpeaking(true); void speakVillagePhrase(word.native, word.sound, playbackLength).catch((error) => setTutorError(readableError(error))).finally(() => { setIsSpeaking(false); setSelectedPronunciationId(null); }); }} aria-label={`Hear ${word.native}`} accessibilityLabel={`Hear ${word.native}`} accessibilityRole="button"><Volume2 size={19} color={heard === word.native ? '#FFFDF7' : '#315C45'} /></Button>
                 </XStack>
               ))}
               {memoryEntries.slice(0, 8).map((entry) => (
                 <XStack key={`verified-${entry.id}`} alignItems="center" justifyContent="space-between">
                   <XStack alignItems="center" gap="$3" flex={1}><YStack backgroundColor="#E8F1E4" borderRadius="$4" padding="$3" maxWidth="68%"><SizableText size="$4" fontWeight="800" color="#315C45" numberOfLines={2}>{entry.phrase}</SizableText></YStack><YStack flex={1}><SizableText fontWeight="700" color="#24362B">{entry.meaning}</SizableText><SizableText size="$2" color="#899087">{entry.pronunciation || 'Elder pronunciation not added yet'}</SizableText></YStack></XStack>
-                  <Button circular size="$4" chromeless backgroundColor="#F2EBDD" onPress={() => { impact(); setHeard(entry.phrase); setIsSpeaking(true); void speakVillagePhrase(entry.phrase, entry.pronunciation).catch((error) => setTutorError(readableError(error))).finally(() => setIsSpeaking(false)); }} aria-label={`Hear ${entry.phrase}`} accessibilityLabel={`Hear ${entry.phrase}`} accessibilityRole="button"><Volume2 size={19} color="#315C45" /></Button>
+                  <Button circular size="$4" chromeless backgroundColor={selectedPronunciationId === entry.id ? '#E79A5A' : '#F2EBDD'} onPress={() => { impact(); setHeard(entry.phrase); setSelectedPronunciationId(entry.id); setIsSpeaking(true); void speakVillagePhrase(entry.phrase, entry.pronunciation, playbackLength).catch((error) => setTutorError(readableError(error))).finally(() => { setIsSpeaking(false); setSelectedPronunciationId(null); }); }} aria-label={`Hear ${entry.phrase}`} accessibilityLabel={`Hear ${entry.phrase}`} accessibilityRole="button"><Volume2 size={19} color="#315C45" /></Button>
                 </XStack>
               ))}
               {heard && <SizableText color="#5F936A">Playing the clear device pronunciation for {heard}. Verified community words are read exactly as elders entered them.</SizableText>}

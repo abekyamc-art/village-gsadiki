@@ -53,4 +53,5 @@ export type VillageVoiceKnowledgeRow = {
   createdAt: string
   updatedAt: string
   answerVariations: string | null
+  audioUrl: string | null
 }
