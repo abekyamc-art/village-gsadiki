@@ -48,7 +48,15 @@ const AVATAR_GREETING = `Mōra, Amara. I am ${TAVI_FULL_NAME}, your Village Voic
 const STUDIO_CLIP_COUNT = 4;
 const RECOGNITION_LOCALE = 'en-US';
 const ASIA_RECOGNITION_LOCALES = ['sw-TZ', 'sw-KE', 'fr-FR', 'en-US'];
+const BACKEND_URL = 'https://kn8pvg1l.backend.blink.new';
+const PREMIUM_AI_COST = 5;
+const PREMIUM_PACKS = [
+  { id: 'starter', label: 'Starter', coins: 100, price: '$9.99' },
+  { id: 'studio', label: 'Studio', coins: 500, price: '$29.99' },
+  { id: 'heritage', label: 'Heritage', coins: 1200, price: '$59.99' },
+] as const;
 
+type PremiumPackId = typeof PREMIUM_PACKS[number]['id'];
 type RecognitionMode = 'offline' | 'online';
 type PlaybackLength = 'short' | 'normal' | 'long';
 type BrowserSpeechRecognizer = {
@@ -414,6 +422,10 @@ export default function Home() {
   const [conversationMode, setConversationMode] = useState<ConversationMode>('chat');
   const [isThinking, setIsThinking] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const [premiumCoins, setPremiumCoins] = useState(0);
+  const [premiumCost, setPremiumCost] = useState(PREMIUM_AI_COST);
+  const [premiumBusy, setPremiumBusy] = useState(false);
+  const [premiumNotice, setPremiumNotice] = useState<string | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [recognitionMode, setRecognitionMode] = useState<RecognitionMode>('offline');
@@ -734,6 +746,58 @@ export default function Home() {
     await AsyncStorage.setItem('village-voice-theme', nextTheme);
   };
 
+  const refreshPremiumBalance = async () => {
+    if (!isSignedIn) {
+      setPremiumCoins(0);
+      return;
+    }
+    try {
+      const token = await blink.auth.getValidToken();
+      const response = await fetch(`${BACKEND_URL}/api/ai/balance`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await response.json() as { coins?: number; costPerAnswer?: number; error?: string };
+      if (!response.ok) throw new Error(data.error || 'Premium AI balance could not be loaded.');
+      setPremiumCoins(Number(data.coins ?? 0));
+      setPremiumCost(Number(data.costPerAnswer ?? PREMIUM_AI_COST));
+    } catch (error) {
+      setPremiumNotice(readableError(error));
+    }
+  };
+
+  useEffect(() => {
+    void refreshPremiumBalance();
+  }, [isSignedIn]);
+
+  const purchasePremiumPack = async (pack: PremiumPackId) => {
+    if (!isSignedIn) {
+      setPremiumNotice('Sign in before purchasing premium AI coins.');
+      return;
+    }
+    setPremiumBusy(true);
+    setPremiumNotice(null);
+    const popup = Platform.OS === 'web' && typeof window !== 'undefined' ? window.open('about:blank', '_blank') : null;
+    try {
+      const token = await blink.auth.getValidToken();
+      const returnUrl = Platform.OS === 'web' && typeof window !== 'undefined' ? `${window.location.origin}${window.location.pathname}` : undefined;
+      const response = await fetch(`${BACKEND_URL}/api/stripe/checkout`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pack, returnUrl }),
+      });
+      const data = await response.json() as { url?: string; error?: string };
+      if (!response.ok || !data.url) throw new Error(data.error || 'Stripe checkout could not be opened.');
+      if (popup) popup.location.href = data.url;
+      else if (Platform.OS === 'web' && typeof window !== 'undefined') window.open(data.url, '_blank');
+      setPremiumNotice('Stripe checkout opened in a new tab. Your coins arrive after payment is confirmed.');
+    } catch (error) {
+      popup?.close();
+      setPremiumNotice(readableError(error));
+    } finally {
+      setPremiumBusy(false);
+    }
+  };
+
   const downloadStudioVideo = async (url: string, index: number) => {
     if (!isSignedIn) {
       setStudioError('Sign in to hear your Tavi lesson.');
@@ -888,42 +952,48 @@ export default function Home() {
   const askGuide = async (promptOverride?: string) => {
     const trimmedQuestion = (promptOverride ?? question).trim();
     if (!trimmedQuestion || isThinking) return;
+    if (!isSignedIn) {
+      setPremiumNotice('Sign in to unlock Tavi’s premium Blink AI tutor.');
+      return;
+    }
     impact();
     setQuestion('');
     setTutorError(null);
+    setPremiumNotice(null);
     const nextMessages: ChatMessage[] = [...messages, { role: 'user', content: trimmedQuestion }];
     setMessages(nextMessages);
     setIsThinking(true);
     try {
-      const currentKnowledge = await readCurrentKnowledge();
-      setAdminEntries(currentKnowledge);
-      const safeQuestion = removeTrashFromText(trimmedQuestion, currentKnowledge);
-      const matchedEntry = currentKnowledge.find((entry) => entry.status === 'verified' && [
-        entry.phrase,
-        entry.pronunciation || '',
-        entry.meaning,
-        ...answerVariations(entry.answerVariations),
-      ].some((alias) => questionIncludesAlias(safeQuestion, alias)));
-      const matchedWord = words.find((word) => [word.native, word.sound, word.meaning].some((alias) => questionIncludesAlias(safeQuestion, alias)));
-      const responseText = matchedEntry
-        ? `${matchedEntry.phrase} means ${matchedEntry.meaning}${matchedEntry.pronunciation ? `. Say it like ${matchedEntry.pronunciation}.` : '.'} ${matchedEntry.context || 'Try using it in a warm village greeting.'}`
-        : matchedWord
-          ? `${matchedWord.native} means ${matchedWord.meaning}. Say it like ${matchedWord.sound}. Try it slowly, then listen for the rhythm.`
-        : safeQuestion.toLocaleLowerCase().includes('hello') || safeQuestion.toLocaleLowerCase().includes('greet')
-          ? 'Mōra means Hello. Try saying it slowly, then listen for the rhythm.'
-          : safeQuestion.toLocaleLowerCase().includes('thank')
-            ? 'Ayo means Thank you. It is a warm way to show appreciation.'
-            : safeQuestion.toLocaleLowerCase().includes('water')
-              ? 'Nami means Water. Repeat it twice and connect it to something you see around you.'
-              : conversationMode === 'joke'
-                ? 'Here is a tiny village-learning joke: Why did the word bring a notebook? Because it wanted to make a good impression!'
-                : conversationMode === 'story'
-                  ? 'Once, a learner carried one new word home each day. Before long, the whole family was greeting one another with a living village voice.'
-                  : 'I can teach verified community words. Ask me about Mōra, Ayo, Nami, or a phrase an elder has added for review.';
-      const safeResponse = removeTrashFromText(responseText, currentKnowledge);
-      setMessages((current) => [...current, { role: 'assistant', content: safeResponse }]);
-      await playAvatar(safeResponse);
+      const token = await blink.auth.getValidToken();
+      const response = await fetch(`${BACKEND_URL}/api/ai/ask`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          question: trimmedQuestion,
+          language: LANGUAGE_LABELS[conversationLanguage],
+          mode: conversationMode,
+          history: messages.slice(-8),
+        }),
+      });
+      const data = await response.json() as { text?: string; coins?: number; costPerAnswer?: number; error?: string };
+      if (!response.ok) {
+        if (response.status === 402) {
+          setPremiumCoins(Number(data.coins ?? premiumCoins));
+          setPremiumCost(Number(data.costPerAnswer ?? PREMIUM_AI_COST));
+          setPremiumNotice(data.error || 'Purchase more coins to continue with premium Tavi AI.');
+          setMessages(messages);
+          return;
+        }
+        throw new Error(data.error || 'Tavi AI could not answer right now.');
+      }
+      const responseText = data.text?.trim();
+      if (!responseText) throw new Error('Tavi AI returned an empty answer.');
+      setPremiumCoins(Number(data.coins ?? Math.max(0, premiumCoins - premiumCost)));
+      setPremiumCost(Number(data.costPerAnswer ?? PREMIUM_AI_COST));
+      setMessages((current) => [...current, { role: 'assistant', content: responseText }]);
+      await playAvatar(responseText);
     } catch (error) {
+      setMessages(messages);
       setTutorError(readableError(error));
     } finally {
       setIsThinking(false);
@@ -1278,23 +1348,51 @@ export default function Home() {
                   </YStack>
                 </XStack>
               ))}
-              <SizableText size="$2" color="#8A542B">Free local guide answers: unlimited · no Blink AI credits used.</SizableText>
-              <SizableText size="$1" color="#46744F">Tavi reads the elder-approved pronunciation guide slowly, twice or three times. A device voice cannot guarantee a native accent; only elder-recorded audio can.</SizableText>
+              <SizableText size="$2" color="#8A542B">Premium Blink AI · {premiumCost} coins per answer · {premiumCoins} coins available</SizableText>
+              <SizableText size="$1" color="#46744F">Tavi now uses real Blink AI with verified community memory. A device voice cannot guarantee a native accent; elder recordings remain the authentic pronunciation.</SizableText>
               {isThinking && <SizableText color="#8A542B">Tavi is thinking in {LANGUAGE_LABELS[conversationLanguage]}…</SizableText>}
               {isTranscribing && <SizableText color="#8A542B">Tavi is listening {recognitionMode === 'offline' ? 'offline on this device' : 'online in your browser'}…</SizableText>}
               <SizableText size="$1" color="#46744F">Recognition is free. Tavi tries the device offline recognizer first, then free Swahili, French, and browser fallbacks. When an elder recording exists, learners hear that authentic village voice; otherwise the device voice is only a fallback.</SizableText>
               <XStack alignItems="center" gap="$2">
-                <Input flex={1} height={48} value={question} onChangeText={(value) => setQuestion(capitalizeTypedText(value))} autoCapitalize="sentences" placeholder={`Ask Tavi in ${LANGUAGE_LABELS[conversationLanguage]}…`} backgroundColor="#FFFDF7" borderColor="#D8C7B0" borderRadius="$4" color="#24362B" onSubmitEditing={() => askGuide()} />
+                <Input flex={1} height={48} value={question} onChangeText={(value) => setQuestion(capitalizeTypedText(value))} autoCapitalize="sentences" placeholder={`Ask Tavi in ${LANGUAGE_LABELS[conversationLanguage]}…`} accessibilityLabel="Question for premium Blink AI Tavi" backgroundColor="#FFFDF7" borderColor="#D8C7B0" borderRadius="$4" color="#24362B" onSubmitEditing={() => void askGuide()} />
                 <Button circular size="$5" backgroundColor={isRecording ? '#B45C4A' : '#E79A5A'} onPress={isRecording ? stopRecording : startRecording} disabled={isThinking || isTranscribing} aria-label={isRecording ? 'Stop microphone recording' : 'Microphone — ask by voice'} accessibilityLabel={isRecording ? 'Stop microphone recording' : 'Microphone — ask by voice'} accessibilityRole="button">
                   {isRecording ? <CircleStop size={18} color="#FFFDF7" /> : <Mic size={18} color="#FFFDF7" />}
                 </Button>
-                <Button circular size="$5" backgroundColor="#E79A5A" onPress={() => askGuide()} disabled={isThinking || isTranscribing} aria-label="Ask Tavi">
-                  <Send size={18} color="#FFFDF7" />
+                <Button height={48} paddingHorizontal="$3" backgroundColor="#E79A5A" borderRadius="$4" onPress={() => void askGuide()} disabled={isThinking || isTranscribing} aria-label="Ask Tavi with premium Blink AI" accessibilityLabel="Ask Tavi with premium Blink AI" accessibilityRole="button">
+                  <Send size={17} color="#FFFDF7" /><SizableText color="#FFFDF7" fontWeight="900">Ask Tavi</SizableText>
+                </Button>
+              </XStack>
+              <XStack gap="$2" flexWrap="wrap">
+                <Button height={38} paddingHorizontal="$3" backgroundColor="#F5EBDD" borderColor="#D8C7B0" borderWidth={1} borderRadius="$10" onPress={() => void askGuide('What does Mōra mean?')} disabled={isThinking || isTranscribing} aria-label="Ask premium AI about Mōra" accessibilityLabel="Ask premium AI about Mōra" accessibilityRole="button">
+                  <SizableText size="$2" color="#573E2A" fontWeight="800">Ask about Mōra</SizableText>
+                </Button>
+                <Button height={38} paddingHorizontal="$3" backgroundColor="#F5EBDD" borderColor="#D8C7B0" borderWidth={1} borderRadius="$10" onPress={() => void askGuide('How do I greet someone in EBEMBE?')} disabled={isThinking || isTranscribing} aria-label="Ask premium AI about greetings" accessibilityLabel="Ask premium AI about greetings" accessibilityRole="button">
+                  <SizableText size="$2" color="#573E2A" fontWeight="800">Practice a greeting</SizableText>
                 </Button>
               </XStack>
               {tutorError && <SizableText color="#B45C4A">{tutorError}</SizableText>}
+              {premiumNotice && <SizableText color={premiumNotice.includes('opened') || premiumNotice.includes('arrive') ? '#46744F' : '#8A542B'}>{premiumNotice}</SizableText>}
+              {!isSignedIn && <SizableText size="$2" color="#8A542B">Sign in to ask the real Blink AI tutor. Premium answers use {premiumCost} coins each.</SizableText>}
             </YStack>
           </Card>
+
+          {isSignedIn && (
+            <Card backgroundColor="#FFF7E7" borderColor="#C97935" borderWidth={1} borderRadius="$6" padding="$4" gap="$3">
+              <YStack gap="$1">
+                <SizableText size="$2" color="#8A542B" fontWeight="900">PREMIUM BLINK AI</SizableText>
+                <H3 color="#24362B">Keep Tavi powered by real AI</H3>
+                <Paragraph color="#667066">Each answer uses {premiumCost} coins so the real language tutor can reason from verified elder knowledge instead of giving a fake offline reply.</Paragraph>
+              </YStack>
+              <XStack gap="$2" flexWrap="wrap">
+                {PREMIUM_PACKS.map((pack) => (
+                  <Button key={pack.id} flex={1} minWidth={96} height={72} backgroundColor={pack.id === 'heritage' ? '#315C45' : '#E79A5A'} borderRadius="$4" onPress={() => void purchasePremiumPack(pack.id)} disabled={premiumBusy} aria-label={`Purchase ${pack.label} ${pack.coins} coin pack`} accessibilityLabel={`Purchase ${pack.label} ${pack.coins} coin pack`} accessibilityRole="button">
+                    <YStack alignItems="center" gap="$1"><SizableText color="#FFFDF7" fontWeight="900">{pack.label}</SizableText><SizableText size="$2" color="#FFFDF7">{pack.coins} coins</SizableText><SizableText size="$2" color="#FFFDF7">{pack.price}</SizableText></YStack>
+                  </Button>
+                ))}
+              </XStack>
+              <SizableText size="$1" color="#8A542B">{Platform.OS === 'web' ? 'Web checkout uses secure Stripe in a new tab. Payment is confirmed by webhook before coins are added.' : 'These premium web checkout buttons are available on the website. Mobile store purchases remain handled by RevenueCat.'}</SizableText>
+            </Card>
+          )}
 
           <Card backgroundColor="#24362B" borderColor="#C97935" borderWidth={1} borderRadius="$6" padding="$4" gap="$4">
             <XStack alignItems="center" justifyContent="space-between" gap="$3">
