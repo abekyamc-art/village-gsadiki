@@ -47,7 +47,9 @@ const AVATAR_URL = 'https://storage.googleapis.com/blink-core-storage/projects/v
 const TAVI_FULL_NAME = 'GLOIRE SADIKI MBEMBE MBONDO MWANA WA BASHIMNYAKA NYUMBA YA MMENDO ELEPONGAA';
 const ADMIN_USER_ID = 'Dc7JZfGsOOVdYYy5EQHZuVaPgv22';
 const AVATAR_GREETING = `Mōra, Amara. I am ${TAVI_FULL_NAME}, your Village Voice guide. Ask me about a word, a greeting, or the story behind our language.`;
-const GUEST_QUESTION_KEY = 'village-voice-guest-questions';
+const FREE_AI_USES = 2;
+const AI_COIN_COST = 1;
+const FREE_AI_USES_KEY = 'village-voice-free-ai-uses';
 const STUDIO_CLIP_COUNT = 4;
 const STUDIO_PACK_INDEX = 1;
 const COIN_PACKS = [
@@ -303,12 +305,9 @@ export default function Home() {
   const [isSignedIn, setIsSignedIn] = useState(false);
   const [currentUserId, setCurrentUserId] = useState<string | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
-  const [authMode, setAuthMode] = useState<'signin' | 'signup'>('signin');
-  const [authEmail, setAuthEmail] = useState('');
-  const [authPassword, setAuthPassword] = useState('');
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
-  const [guestQuestionCount, setGuestQuestionCount] = useState(0);
+  const [freeUsesUsed, setFreeUsesUsed] = useState(0);
   const [coinNotice, setCoinNotice] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [completed, setCompleted] = useState(false);
@@ -348,6 +347,7 @@ export default function Home() {
   const [coinBalance, setCoinBalance] = useState(0);
   const [coinBalanceLoading, setCoinBalanceLoading] = useState(false);
   const [coinBalanceError, setCoinBalanceError] = useState<string | null>(null);
+  const [walletOpen, setWalletOpen] = useState(false);
   const [adminEntryForm, setAdminEntryForm] = useState({ phrase: '', meaning: '', pronunciation: '', context: '', answerVariations: '' });
   const [adminEditForm, setAdminEditForm] = useState({ phrase: '', meaning: '', pronunciation: '', context: '', answerVariations: '' });
   const isAdminRef = useRef(false);
@@ -368,9 +368,13 @@ export default function Home() {
         const nextProfile = { displayName: state.user.displayName };
         setProfile(nextProfile);
         setProfileName(state.user.displayName || '');
+        void AsyncStorage.getItem(`${FREE_AI_USES_KEY}-${state.user.id}`).then((saved) => {
+          setFreeUsesUsed(Math.min(FREE_AI_USES, Number(saved) || 0));
+        });
       } else {
         setProfile({});
         setProfileName('');
+        setFreeUsesUsed(0);
       }
       if (!state.isLoading) setAuthLoading(false);
     });
@@ -381,13 +385,6 @@ export default function Home() {
     void AsyncStorage.getItem('village-voice-theme').then((savedTheme) => {
       if (savedTheme === 'dark' || savedTheme === 'light') setAppTheme(savedTheme);
     });
-  }, []);
-
-  useEffect(() => {
-    void (async () => {
-      const savedCount = await AsyncStorage.getItem(GUEST_QUESTION_KEY);
-      if (savedCount) setGuestQuestionCount(Math.min(2, Number(savedCount) || 0));
-    })();
   }, []);
 
   useEffect(() => {
@@ -481,26 +478,6 @@ export default function Home() {
       if (channel) void channel.unsubscribe();
     };
   }, [currentUserId, isSignedIn]);
-
-  const submitAuth = async () => {
-    if (!authEmail.trim() || !authPassword) {
-      setAuthError('Enter your email and password to meet Tavi.');
-      return;
-    }
-    setAuthBusy(true);
-    setAuthError(null);
-    try {
-      if (authMode === 'signup') {
-        await blink.auth.signUp({ email: authEmail.trim(), password: authPassword, metadata: { displayName: 'Village Voice learner' } });
-      } else {
-        await blink.auth.signInWithEmail(authEmail.trim(), authPassword);
-      }
-    } catch (error) {
-      setAuthError(readableError(error));
-    } finally {
-      setAuthBusy(false);
-    }
-  };
 
   const chooseAnswer = (answer: string) => {
     impact();
@@ -720,10 +697,25 @@ export default function Home() {
     }
   };
 
+  const switchAccount = async () => {
+    impact();
+    setAuthBusy(true);
+    setAuthError(null);
+    try {
+      await blink.auth.signOut();
+      await blink.auth.signInWithGoogle();
+    } catch (error) {
+      setAuthError(readableError(error));
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
   const playAvatar = async (text: string) => {
     impact();
     if (!isSignedIn) {
-      setAuthError('Sign in below to let Tavi speak with you.');
+      setAuthError('Continue with Google to let Tavi speak with you.');
+      await signInWithGoogle();
       return;
     }
     setIsSpeaking(true);
@@ -737,23 +729,39 @@ export default function Home() {
     }
   };
 
+  const consumeCoin = async () => {
+    if (!currentUserId) return false;
+    const rows = await coinBalancesTable.list({ where: { userId: currentUserId }, limit: 1 });
+    const balance = rows[0];
+    const available = Number(balance?.coins ?? coinBalance);
+    if (!balance || available < AI_COIN_COST) return false;
+    await coinBalancesTable.update(balance.id, { coins: available - AI_COIN_COST, updatedAt: new Date().toISOString() });
+    setCoinBalance(available - AI_COIN_COST);
+    return true;
+  };
+
+  const markFreeUse = async () => {
+    const next = Math.min(FREE_AI_USES, freeUsesUsed + 1);
+    setFreeUsesUsed(next);
+    if (currentUserId) await AsyncStorage.setItem(`${FREE_AI_USES_KEY}-${currentUserId}`, String(next));
+  };
+
   const askGuide = async (promptOverride?: string) => {
     const trimmedQuestion = (promptOverride ?? question).trim();
     if (!trimmedQuestion || isThinking) return;
-    if (!isSignedIn && guestQuestionCount >= 2) {
-      setAuthError('You have used both guest questions. Sign in to keep learning with Tavi.');
+    if (!isSignedIn) {
+      setAuthError('Continue with Google to send your question to Tavi.');
+      await signInWithGoogle();
+      return;
+    }
+    if (freeUsesUsed >= FREE_AI_USES && !coinBalanceLoading && coinBalance < AI_COIN_COST) {
+      setCoinNotice('You used your two free answers. Add coins to continue speaking with Tavi.');
+      setWalletOpen(true);
       return;
     }
     impact();
     setQuestion('');
     setTutorError(null);
-    if (!isSignedIn) {
-      setGuestQuestionCount((count) => {
-        const nextCount = Math.min(2, count + 1);
-        void AsyncStorage.setItem(GUEST_QUESTION_KEY, String(nextCount));
-        return nextCount;
-      });
-    }
     const nextMessages: ChatMessage[] = [...messages, { role: 'user', content: trimmedQuestion }];
     setMessages(nextMessages);
     setIsThinking(true);
@@ -768,10 +776,19 @@ export default function Home() {
         ],
       });
       const safeResponse = removeTrashFromText(response.text, currentKnowledge);
+      if (freeUsesUsed < FREE_AI_USES) {
+        await markFreeUse();
+      } else if (!(await consumeCoin())) {
+        setCoinNotice('You need 1 coin to continue. Open Wallet to add coins.');
+        setWalletOpen(true);
+        throw new Error('Payment required.');
+      }
       setMessages((current) => [...current, { role: 'assistant', content: safeResponse }]);
-      if (isSignedIn) await playAvatar(safeResponse);
+      await playAvatar(safeResponse);
     } catch (error) {
-      setTutorError(readableError(error));
+      if (!(error instanceof Error && error.message === 'Payment required')) {
+        setTutorError(readableError(error));
+      }
     } finally {
       setIsThinking(false);
     }
@@ -948,8 +965,14 @@ export default function Home() {
 
   const startRecording = async () => {
     if (isRecording || isTranscribing) return;
-    if (!isSignedIn && guestQuestionCount >= 2) {
-      setAuthError('You have used both guest questions. Sign in before speaking with Tavi again.');
+    if (!isSignedIn && freeUsesUsed >= FREE_AI_USES) {
+      setAuthError('Your two free questions are used. Continue with Google to keep learning with Tavi.');
+      await signInWithGoogle();
+      return;
+    }
+    if (isSignedIn && freeUsesUsed >= FREE_AI_USES && coinBalance < AI_COIN_COST) {
+      setCoinNotice('Add coins in Wallet before recording another question.');
+      setWalletOpen(true);
       return;
     }
     setTutorError(null);
@@ -1026,9 +1049,9 @@ export default function Home() {
             <Card backgroundColor={appTheme === 'dark' ? '#1B2A20' : '#FFFDF7'} borderColor={appTheme === 'dark' ? '#42634B' : '#D8C7B0'} borderWidth={1} borderRadius="$5" padding="$4" gap="$3">
               <XStack alignItems="center" justifyContent="space-between" gap="$3">
                 <YStack flex={1} gap="$1">
-                  <SizableText size="$2" color="#C97935" fontWeight="900">YOUR PROFILE</SizableText>
+                  <SizableText size="$2" color="#C97935" fontWeight="900">YOUR ACCOUNT</SizableText>
                   <H3 color={appTheme === 'dark' ? '#FFFDF7' : '#24362B'}>{profile.displayName || 'Village Voice learner'}</H3>
-                  <SizableText size="$2" color={appTheme === 'dark' ? '#C9E3C5' : '#667066'}>Personalize your name and reading mode.</SizableText>
+                  <SizableText size="$2" color={appTheme === 'dark' ? '#C9E3C5' : '#667066'}>Manage your profile and reading mode.</SizableText>
                 </YStack>
                 <Button height={44} paddingHorizontal="$3" backgroundColor="#315C45" borderRadius="$4" onPress={() => void toggleAppTheme()}>
                   <SizableText color="#FFFDF7" fontWeight="800">{appTheme === 'dark' ? 'White mode' : 'Black mode'}</SizableText>
@@ -1075,7 +1098,7 @@ export default function Home() {
                 <H2 color="#573E2A" fontSize={24}>Meet Tavi</H2>
                 <SizableText size="$1" color="#8A542B" fontWeight="700" maxWidth={190}>{TAVI_FULL_NAME}</SizableText>
                 <Paragraph color="#765F4B" size="$3">Ask a question and Tavi will answer using verified community words.</Paragraph>
-                  <Button height={46} alignSelf="flex-start" backgroundColor="#315C45" borderRadius="$4" onPress={() => playAvatar(AVATAR_GREETING)} disabled={isSpeaking}>
+                  <Button height={46} alignSelf="flex-start" backgroundColor="#315C45" borderRadius="$4" onPress={() => void playAvatar(AVATAR_GREETING)} disabled={isSpeaking || !isSignedIn}>
                   {isSpeaking ? <SizableText color="#FFFDF7" fontWeight="800">Speaking…</SizableText> : <><Play size={16} color="#FFFDF7" /><SizableText color="#FFFDF7" fontWeight="800">Hear greeting</SizableText></>}
                 </Button>
               </YStack>
@@ -1102,7 +1125,7 @@ export default function Home() {
                   </YStack>
                 </XStack>
               ))}
-              {!isSignedIn && <SizableText size="$2" color="#8A542B">Guest questions: {guestQuestionCount}/2. Sign in for unlimited voice conversations.</SizableText>}
+              <SizableText size="$2" color="#8A542B">{isSignedIn ? `Free AI answers: ${Math.max(0, FREE_AI_USES - freeUsesUsed)}/${FREE_AI_USES} · then ${AI_COIN_COST} coin per answer.` : `Free AI answers: ${Math.max(0, FREE_AI_USES - freeUsesUsed)}/${FREE_AI_USES} · after that, Continue with Google.`}</SizableText>
               {isThinking && <SizableText color="#8A542B">Tavi is thinking in {LANGUAGE_LABELS[conversationLanguage]}…</SizableText>}
               {isTranscribing && <SizableText color="#8A542B">Tavi is listening to your question…</SizableText>}
               <XStack alignItems="center" gap="$2">
@@ -1158,24 +1181,11 @@ export default function Home() {
             <Card backgroundColor="#FFFDF7" borderColor="#D8C7B0" borderWidth={1} borderRadius="$5" padding="$4" gap="$3">
               <YStack gap="$1">
                 <H3 color="#24362B">Keep learning with Tavi</H3>
-                <Paragraph color="#667066">You can try two guest questions. Sign in with Google for unlimited questions, voice replies, progress, and the coin market.</Paragraph>
+                <Paragraph color="#667066">You get two free AI answers. Continue with Google to unlock your account, wallet, and coin-powered conversations.</Paragraph>
               </YStack>
-              <Button height={48} backgroundColor="#FFFDF7" borderColor="#D8C7B0" borderWidth={1} borderRadius="$4" onPress={signInWithGoogle} disabled={authBusy}>
-                <SizableText color="#24362B" fontWeight="800">{authBusy ? 'Opening Google…' : 'Continue with Google'}</SizableText>
+              <Button height={52} backgroundColor="#FFFDF7" borderColor="#315C45" borderWidth={2} borderRadius="$4" onPress={() => void signInWithGoogle()} disabled={authBusy}>
+                <SizableText color="#24362B" fontWeight="900">{authBusy ? 'Opening Google…' : 'Continue with Google'}</SizableText>
               </Button>
-              <XStack alignItems="center" gap="$2"><YStack flex={1} height={1} backgroundColor="#E7E1D3" /><SizableText size="$2" color="#899087">or use email</SizableText><YStack flex={1} height={1} backgroundColor="#E7E1D3" /></XStack>
-              <XStack gap="$2" flexWrap="wrap">
-                <Input flex={1} minWidth={180} height={48} value={authEmail} onChangeText={setAuthEmail} placeholder="Email address" autoCapitalize="none" keyboardType="email-address" backgroundColor="#F7F4EC" borderColor="#E7E1D3" borderRadius="$4" color="#24362B" />
-                <Input flex={1} minWidth={180} height={48} value={authPassword} onChangeText={setAuthPassword} placeholder="Password" secureTextEntry backgroundColor="#F7F4EC" borderColor="#E7E1D3" borderRadius="$4" color="#24362B" />
-              </XStack>
-              <XStack alignItems="center" gap="$3" flexWrap="wrap">
-                <Button height={48} backgroundColor="#315C45" borderRadius="$4" onPress={submitAuth} disabled={authBusy}>
-                  <SizableText color="#FFFDF7" fontWeight="800">{authBusy ? 'Connecting…' : authMode === 'signin' ? 'Sign in' : 'Create learner account'}</SizableText>
-                </Button>
-                <Button chromeless onPress={() => { setAuthMode(authMode === 'signin' ? 'signup' : 'signin'); setAuthError(null); }}>
-                  <SizableText color="#C97935" fontWeight="700">{authMode === 'signin' ? 'Create account' : 'I have an account'}</SizableText>
-                </Button>
-              </XStack>
               {authError && <SizableText color="#B45C4A">{authError}</SizableText>}
             </Card>
           )}
@@ -1287,29 +1297,37 @@ export default function Home() {
           {isSignedIn && !authLoading && (
             <Card backgroundColor="#FFF1D1" borderColor="#F4C66A" borderWidth={1} borderRadius="$5" padding="$4" gap="$3">
               <XStack alignItems="center" justifyContent="space-between">
-                <YStack gap="$1"><SizableText size="$2" color="#8A542B" fontWeight="800">LEARNER COINS</SizableText><H3 color="#573E2A">Ready for more practice?</H3></YStack>
+                <YStack gap="$1"><SizableText size="$2" color="#8A542B" fontWeight="800">WALLET</SizableText><H3 color="#573E2A">Keep your Tavi balance ready</H3></YStack>
                 <SizableText size="$6" color="#C97935" fontWeight="900">{coinBalanceLoading ? '…' : coinBalance.toLocaleString()}</SizableText>
               </XStack>
-              <Paragraph color="#765F4B">Spend coins on bonus lessons, story packs, and pronunciation practice.</Paragraph>
-              {coinBalanceError && <SizableText size="$2" color="#B45C4A">{coinBalanceError}</SizableText>}
-              <XStack gap="$2" flexWrap="wrap">
-                {(coinPackages.length ? coinPackages : [null, null, null]).map((coinPackage, index) => (
-                  <Button key={coinPackage?.identifier ?? `coin-placeholder-${index}`} flex={1} minWidth={92} height={58} backgroundColor="#E79A5A" borderRadius="$4" onPress={() => buyCoinPackage(index)} disabled={!coinPackage || coinMarketLoading}>
-                    <YStack alignItems="center" gap="$1"><SizableText size="$2" color="#FFFDF7" fontWeight="800">{COIN_PACKS[index].coins.toLocaleString()}</SizableText><SizableText size="$1" color="#FFFDF7">{coinPackage?.product.priceString ?? (coinMarketLoading ? 'Loading…' : 'Unavailable')}</SizableText></YStack>
-                  </Button>
-                ))}
-              </XStack>
-              <XStack alignItems="center" justifyContent="space-between">
-                <Button chromeless onPress={restoreCoins}><SizableText size="$2" color="#8A542B" fontWeight="700">Restore purchases</SizableText></Button>
-                <Button chromeless onPress={() => void refreshCoinMarket()}><SizableText size="$2" color="#8A542B" fontWeight="700">Refresh packs</SizableText></Button>
-              </XStack>
-              {coinMarketError && <SizableText size="$2" color="#8A542B">{coinMarketError}</SizableText>}
-              {coinNotice && <SizableText size="$2" color="#8A542B">{coinNotice}</SizableText>}
+              <Button height={44} backgroundColor="#315C45" borderRadius="$4" onPress={() => setWalletOpen((open) => !open)}>
+                <SizableText color="#FFFDF7" fontWeight="900">{walletOpen ? 'Hide coin packs' : 'Open wallet · Buy coins'}</SizableText>
+              </Button>
+              <Paragraph color="#765F4B">After your two free answers, each AI answer costs 1 coin. Buy coins securely with real money through the App Store or Google Play.</Paragraph>
+              {walletOpen && (
+                <YStack gap="$3">
+                  {coinBalanceError && <SizableText size="$2" color="#B45C4A">{coinBalanceError}</SizableText>}
+                  <XStack gap="$2" flexWrap="wrap">
+                    {(coinPackages.length ? coinPackages : [null, null, null]).map((coinPackage, index) => (
+                      <Button key={coinPackage?.identifier ?? `coin-placeholder-${index}`} flex={1} minWidth={92} height={58} backgroundColor="#E79A5A" borderRadius="$4" onPress={() => void buyCoinPackage(index)} disabled={!coinPackage || coinMarketLoading}>
+                        <YStack alignItems="center" gap="$1"><SizableText size="$2" color="#FFFDF7" fontWeight="800">{COIN_PACKS[index].coins.toLocaleString()}</SizableText><SizableText size="$1" color="#FFFDF7">{coinPackage?.product.priceString ?? (coinMarketLoading ? 'Loading…' : 'Unavailable')}</SizableText></YStack>
+                      </Button>
+                    ))}
+                  </XStack>
+                  <XStack alignItems="center" justifyContent="space-between">
+                    <Button chromeless onPress={() => void restoreCoins()}><SizableText size="$2" color="#8A542B" fontWeight="700">Restore purchases</SizableText></Button>
+                    <Button chromeless onPress={() => void refreshCoinMarket()}><SizableText size="$2" color="#8A542B" fontWeight="700">Refresh packs</SizableText></Button>
+                  </XStack>
+                  {coinMarketError && <SizableText size="$2" color="#8A542B">{coinMarketError}</SizableText>}
+                  {coinNotice && <SizableText size="$2" color="#8A542B">{coinNotice}</SizableText>}
+                </YStack>
+              )}
             </Card>
           )}
           {isSignedIn && !authLoading && (
-            <XStack justifyContent="flex-end">
-              <Button chromeless onPress={() => blink.auth.signOut()}><SizableText color="#8A542B" fontWeight="700">Sign out</SizableText></Button>
+            <XStack justifyContent="flex-end" gap="$3">
+              <Button chromeless onPress={() => void switchAccount()} disabled={authBusy}><SizableText color="#8A542B" fontWeight="700">Switch account</SizableText></Button>
+              <Button chromeless onPress={() => void blink.auth.signOut()} disabled={authBusy}><SizableText color="#B45C4A" fontWeight="700">Log out</SizableText></Button>
             </XStack>
           )}
 
