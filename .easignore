@@ -1,0 +1,12 @@
+node_modules/
+.git/
+.git-credentials
+.blink-checkpoint.lock
+.blink-locks/
+*.blink-tmp
+.expo/
+dist/
+build/
+.cache/
+*.tgz
+*.log
