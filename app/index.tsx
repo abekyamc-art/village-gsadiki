@@ -27,6 +27,8 @@ import {
   Volume2,
   Pencil,
   X,
+  Wallet,
+  RefreshCw,
   XStack,
   YStack,
   Card,
@@ -426,6 +428,7 @@ export default function Home() {
   const [premiumCost, setPremiumCost] = useState(PREMIUM_AI_COST);
   const [premiumBusy, setPremiumBusy] = useState(false);
   const [premiumNotice, setPremiumNotice] = useState<string | null>(null);
+  const [paymentRefreshing, setPaymentRefreshing] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [recognitionMode, setRecognitionMode] = useState<RecognitionMode>('offline');
@@ -767,6 +770,27 @@ export default function Home() {
 
   useEffect(() => {
     void refreshPremiumBalance();
+  }, [isSignedIn]);
+
+  useEffect(() => {
+    if (Platform.OS !== 'web' || typeof window === 'undefined' || !isSignedIn) return;
+    const payment = new URLSearchParams(window.location.search).get('payment');
+    if (payment !== 'success' && payment !== 'cancelled') return;
+    if (payment === 'success') {
+      setPremiumNotice('Payment received. Refresh your wallet in a moment while Stripe confirms the purchase.');
+      setPaymentRefreshing(true);
+      const refresh = async () => {
+        for (let attempt = 0; attempt < 5; attempt += 1) {
+          await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? 1200 : 1800));
+          await refreshPremiumBalance();
+        }
+        setPaymentRefreshing(false);
+      };
+      void refresh();
+    } else {
+      setPremiumNotice('Checkout was cancelled. No coins were charged.');
+    }
+    window.history.replaceState({}, '', window.location.pathname);
   }, [isSignedIn]);
 
   const purchasePremiumPack = async (pack: PremiumPackId) => {
@@ -1348,6 +1372,10 @@ export default function Home() {
                   </YStack>
                 </XStack>
               ))}
+              <XStack alignItems="center" justifyContent="space-between" gap="$2" backgroundColor="#FFF7E7" borderRadius="$4" padding="$3">
+                <XStack alignItems="center" gap="$2" flex={1}><Wallet size={18} color="#8A542B" /><YStack><SizableText size="$2" color="#8A542B" fontWeight="900">YOUR AI WALLET</SizableText><SizableText size="$3" color="#573E2A" fontWeight="900">{premiumCoins} coins remaining</SizableText></YStack></XStack>
+                <Button circular size="$4" backgroundColor="#F4C66A" onPress={() => void refreshPremiumBalance()} disabled={paymentRefreshing} aria-label="Refresh coin wallet" accessibilityLabel="Refresh coin wallet" accessibilityRole="button"><RefreshCw size={16} color="#573E2A" /></Button>
+              </XStack>
               <SizableText size="$2" color="#8A542B">Premium Blink AI · {premiumCost} coins per answer · {premiumCoins} coins available</SizableText>
               <SizableText size="$1" color="#46744F">Tavi now uses real Blink AI with verified community memory. A device voice cannot guarantee a native accent; elder recordings remain the authentic pronunciation.</SizableText>
               {isThinking && <SizableText color="#8A542B">Tavi is thinking in {LANGUAGE_LABELS[conversationLanguage]}…</SizableText>}
@@ -1379,9 +1407,9 @@ export default function Home() {
           {isSignedIn && (
             <Card backgroundColor="#FFF7E7" borderColor="#C97935" borderWidth={1} borderRadius="$6" padding="$4" gap="$3">
               <YStack gap="$1">
-                <SizableText size="$2" color="#8A542B" fontWeight="900">PREMIUM BLINK AI</SizableText>
+                <XStack alignItems="center" gap="$2"><Wallet size={18} color="#8A542B" /><SizableText size="$2" color="#8A542B" fontWeight="900">COIN MARKET · REAL CHECKOUT</SizableText></XStack>
                 <H3 color="#24362B">Keep Tavi powered by real AI</H3>
-                <Paragraph color="#667066">Each answer uses {premiumCost} coins so the real language tutor can reason from verified elder knowledge instead of giving a fake offline reply.</Paragraph>
+                <Paragraph color="#667066">Each answer uses {premiumCost} coins. Buy coins securely with Stripe to unlock premium conversations, and your wallet updates after payment confirmation.</Paragraph>
               </YStack>
               <XStack gap="$2" flexWrap="wrap">
                 {PREMIUM_PACKS.map((pack) => (
@@ -1390,7 +1418,8 @@ export default function Home() {
                   </Button>
                 ))}
               </XStack>
-              <SizableText size="$1" color="#8A542B">{Platform.OS === 'web' ? 'Web checkout uses secure Stripe in a new tab. Payment is confirmed by webhook before coins are added.' : 'These premium web checkout buttons are available on the website. Mobile store purchases remain handled by RevenueCat.'}</SizableText>
+              <SizableText size="$1" color="#8A542B">{Platform.OS === 'web' ? 'Secure Stripe checkout opens in a new tab. You can use a promotion code, and coins are added only after Stripe confirms payment.' : 'Mobile store purchases remain handled by RevenueCat. Website purchases use Stripe.'}</SizableText>
+              {paymentRefreshing && <XStack alignItems="center" gap="$2"><RefreshCw size={14} color="#8A542B" /><SizableText size="$2" color="#8A542B">Confirming your payment and refreshing the wallet…</SizableText></XStack>}
             </Card>
           )}
 

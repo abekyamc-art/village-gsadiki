@@ -126,28 +126,42 @@ app.post('/api/ai/ask', async (c) => {
   } else {
     return c.json({ error: 'Your premium AI wallet is not ready yet. Purchase a coin pack first.' }, 402)
   }
+  await blink.db.table('village_voice_coin_transactions').create({
+    id: `ai_${crypto.randomUUID()}`,
+    userId,
+    productId: 'premium_ai_answer',
+    coins: -AI_COST,
+    revenuecatEventId: null as string | null,
+  })
   return c.json({ text: result.text, coins: currentCoins - AI_COST, costPerAnswer: AI_COST })
 })
 
 app.post('/api/stripe/checkout', async (c) => {
   const env = c.env as Env
   const blink = getBlink(env)
-  const userId = await requireUser(c, blink)
-  if (!userId) return c.json({ error: 'Sign in before purchasing coins.' }, 401)
+  const auth = await blink.auth.verifyToken(c.req.header('Authorization') ?? null)
+  if (!auth.valid || !auth.userId) return c.json({ error: 'Sign in before purchasing coins.' }, 401)
   const body = await c.req.json() as { pack?: PackId; returnUrl?: string }
   const pack = body.pack && PACKS[body.pack] ? PACKS[body.pack] : null
   if (!pack) return c.json({ error: 'Choose a valid Village Voice coin pack.' }, 400)
   const returnUrl = body.returnUrl?.startsWith('http') ? body.returnUrl : DEFAULT_RETURN_URL
+  const successUrl = new URL(returnUrl)
+  successUrl.searchParams.set('payment', 'success')
+  const cancelUrl = new URL(returnUrl)
+  cancelUrl.searchParams.set('payment', 'cancelled')
   const params = new URLSearchParams()
   params.set('mode', 'payment')
-  params.set('success_url', `${returnUrl}?payment=success`)
-  params.set('cancel_url', `${returnUrl}?payment=cancelled`)
+  params.set('success_url', successUrl.toString())
+  params.set('cancel_url', cancelUrl.toString())
   params.set('billing_address_collection', 'auto')
+  params.set('allow_promotion_codes', 'true')
+  params.set('client_reference_id', auth.userId)
+  if (auth.email) params.set('customer_email', auth.email)
   params.set('line_items[0][price_data][currency]', 'usd')
   params.set('line_items[0][price_data][product]', pack.product)
   params.set('line_items[0][price_data][unit_amount]', String(pack.amount))
   params.set('line_items[0][quantity]', '1')
-  params.set('metadata[user_id]', userId)
+  params.set('metadata[user_id]', auth.userId)
   params.set('metadata[coins]', String(pack.coins))
   params.set('metadata[pack]', body.pack || 'starter')
   try {
